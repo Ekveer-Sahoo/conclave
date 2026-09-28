@@ -1,9 +1,20 @@
 {
   "name": "@conclave/core",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Domain schemas and shared types for Conclave: roles, seats, findings/verdicts, and the EventEnvelope union. No I/O.",
+  "license": "MIT",
+  "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

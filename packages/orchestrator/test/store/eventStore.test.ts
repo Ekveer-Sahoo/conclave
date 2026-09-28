@@ -89,7 +89,40 @@ test("listSessions returns every distinct session id in the log", () => {
     payload: { sessionId: "session-b", task: "B", budgetCeilingUsd: 5, minQuorum: 3 },
   });
 
-  assert.deepEqual(store.listSessions(), ["session-a", "session-b"]);
+  // Most-recently-active session first, so session-history UIs surface newest sessions up top.
+  assert.deepEqual(store.listSessions(), ["session-b", "session-a"]);
+
+  store.close();
+});
+
+test("listSessions pages with limit/offset over most-recently-active order", () => {
+  const store = new EventStore(":memory:");
+  for (const id of ["s1", "s2", "s3"]) {
+    store.append(id, { type: "SessionCreated", payload: { sessionId: id, task: id, budgetCeilingUsd: 5, minQuorum: 3 } });
+  }
+  assert.deepEqual(store.listSessions(2, 0), ["s3", "s2"]);
+  assert.deepEqual(store.listSessions(2, 2), ["s1"]);
+  store.close();
+});
+
+test("replaySince returns only events strictly after the given seq, capped at limit", () => {
+  const store = new EventStore(":memory:");
+  store.append("s1", { type: "SessionCreated", payload: { sessionId: "s1", task: "t", budgetCeilingUsd: 5, minQuorum: 3 } });
+  store.append("s1", { type: "UserMessagePosted", payload: { text: "hi" } });
+  store.append("s1", { type: "UserMessagePosted", payload: { text: "again" } });
+  const all = store.replay("s1");
+  const firstSeq = all[0]!.seq;
+
+  const since = store.replaySince("s1", firstSeq);
+  assert.equal(since.length, 2);
+  assert.deepEqual(
+    since.map((e) => e.type),
+    ["UserMessagePosted", "UserMessagePosted"],
+  );
+
+  const capped = store.replaySince("s1", 0, 1);
+  assert.equal(capped.length, 1);
+  assert.equal(capped[0]!.seq, all[0]!.seq);
 
   store.close();
 });
@@ -159,5 +192,19 @@ test("replaying the log and re-running projectSession reproduces the same final 
   assert.equal(liveProjection.lastPhaseOutcome, "advance");
   assert.equal(liveProjection.seatInvocations["call-ok"]?.verdict?.overall_verdict, "APPROVE");
 
+  store.close();
+});
+
+test("usageSince treats a BudgetSpent with no authoritative usage as zero, never NaN (which would disable spend limits)", () => {
+  const store = new EventStore(":memory:");
+  const base = { phase: "PLAN_AUDIT" as const, round: 0, latencyMs: 5 };
+  store.append("s1", { type: "BudgetSpent", payload: { ...base, correlationId: "a", seat: "codex", usageAvailable: true, promptTokens: 100, completionTokens: 50, costUsd: 0.25, costSource: "local_estimate" } });
+  store.append("s1", { type: "BudgetSpent", payload: { ...base, correlationId: "b", seat: "codex", usageAvailable: false, costSource: "unavailable" } });
+  store.append("s1", { type: "BudgetSpent", payload: { ...base, correlationId: "c", usageAvailable: false, costSource: "unavailable" } });
+  const usage = store.usageSince("1970-01-01T00:00:00.000Z");
+  const total = usage.reduce((sum, seat) => sum + seat.costUsd, 0);
+  assert.ok(Number.isFinite(total));
+  assert.equal(total, 0.25);
+  assert.deepEqual(usage.find((seat) => seat.seat === "codex"), { seat: "codex", promptTokens: 100, completionTokens: 50, costUsd: 0.25 });
   store.close();
 });

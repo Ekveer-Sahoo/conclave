@@ -1,0 +1,2 @@
+⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login · Unset it to load your organization's connectors
+{"type":"result","subtype":"success","total_cost_usd":0.0138068,"usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":68814,"output_tokens":4},"permission_denials":[]}

@@ -22,10 +22,18 @@ export const VerdictSchema = z.object({
   findings: z.array(FindingSchema),
   overall_verdict: z.enum(["APPROVE", "APPROVE_WITH_CHANGES", "REJECT"]),
   verdict_reasoning: z.string(),
-  raw_usage: z.object({
-    promptTokens: z.number().int().nonnegative(),
-    completionTokens: z.number().int().nonnegative(),
-  }),
+  /**
+   * A model's self-reported token counts. Never used for spend — real usage comes from the
+   * provider's own envelope — and no longer asked of models: requiring a field a model cannot
+   * actually know made a live seat fail its vote five times over omitting it. Still accepted, since
+   * older events and scripted providers carry it.
+   */
+  raw_usage: z
+    .object({
+      promptTokens: z.number().int().nonnegative(),
+      completionTokens: z.number().int().nonnegative(),
+    })
+    .optional(),
   compression: z
     .object({
       before: z.number().int().nonnegative(),

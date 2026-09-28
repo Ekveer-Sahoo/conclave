@@ -1,17 +1,32 @@
 {
   "name": "@conclave/orchestrator",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Event-sourced multi-model council orchestrator for Conclave: CLI, web server, and session engine.",
+  "license": "MIT",
+  "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "conclave": "./dist/cli/index.js"
+    "conclave": "./dist/cli/index.js",
+    "conclave-web": "./dist/web.js"
   },
+  "files": [
+    "dist",
+    "public",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "build": "tsc -p tsconfig.json && node scripts/copy-public.mjs && node scripts/chmod-bin.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --experimental-strip-types test/**/*.test.ts test/**/**/*.test.ts",
-    "doctor": "node --experimental-strip-types src/cli/index.ts doctor"
+    "test": "node --test --test-concurrency=4 --experimental-strip-types test/**/*.test.ts",
+    "doctor": "node dist/cli/index.js doctor",
+    "web": "node dist/web.js"
   },
   "dependencies": {
     "@conclave/core": "workspace:*",

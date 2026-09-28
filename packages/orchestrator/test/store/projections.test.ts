@@ -80,6 +80,32 @@ const events: StoredEvent[] = [
     },
   ],
   [
+    "CommandVerificationRun",
+    {
+      correlationId: "cmd-1",
+      seat: "claude",
+      phase: "WORK_AUDIT",
+      round: 0,
+      command: "node --test",
+      result: "PASS",
+      exitCode: 0,
+      output: "# pass 12",
+      findingId: "finding-1",
+    },
+  ],
+  [
+    "CommandVerificationRun",
+    {
+      correlationId: "cmd-2",
+      seat: "claude",
+      phase: "WORK_AUDIT",
+      round: 0,
+      command: "git status",
+      result: "DENIED",
+      output: "permission denied",
+    },
+  ],
+  [
     "ArbitrationRuled",
     { contentionId: "contention-1", arbiters: ["kimi"], ruling: "Add guard.", reasoning: "Safer." },
   ],
@@ -104,6 +130,7 @@ const events: StoredEvent[] = [
       latencyMs: 100,
     },
   ],
+  ["SessionConcluded", { outcome: "NOT_APPROVED", reason: "plan not ratified within 3 round(s)" }],
   ["SessionErrored", { message: "recoverable", fatal: false }],
   ["SessionErrored", { message: "fatal", fatal: true }],
   ["WorktreeKept", { reason: "User requested inspection." }],
@@ -152,10 +179,36 @@ test("projectSession folds every event type", () => {
       output: "passing",
     },
   ]);
+  assert.deepEqual(projection.commandVerifications, [
+    {
+      correlationId: "cmd-1",
+      seat: "claude",
+      phase: "WORK_AUDIT",
+      round: 0,
+      command: "node --test",
+      result: "PASS",
+      exitCode: 0,
+      output: "# pass 12",
+      findingId: "finding-1",
+    },
+    {
+      correlationId: "cmd-2",
+      seat: "claude",
+      phase: "WORK_AUDIT",
+      round: 0,
+      command: "git status",
+      result: "DENIED",
+      exitCode: undefined,
+      output: "permission denied",
+      findingId: undefined,
+    },
+  ]);
   assert.deepEqual(projection.arbitrations["contention-1"], {
     arbiters: ["kimi"],
     ruling: "Add guard.",
     reasoning: "Safer.",
+    // Events written before rulings carried a source are, by construction, policy rulings.
+    source: "policy",
   });
   assert.deepEqual(projection.ratifications, [
     { phase: "RATIFY_PLAN", round: 0, seat: "gemini", vote: "APPROVE", citedContentionId: "contention-1" },
@@ -165,4 +218,7 @@ test("projectSession folds every event type", () => {
   assert.equal(projection.spentUsd, 0.25);
   assert.equal(projection.errored, true);
   assert.equal(projection.fatalError, "fatal");
+  assert.equal(projection.outcome, "NOT_APPROVED");
+  assert.equal(projection.outcomeReason, "plan not ratified within 3 round(s)");
+  assert.equal(projection.planVersion, 2);
 });

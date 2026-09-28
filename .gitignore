@@ -1,9 +1,13 @@
 node_modules/
 .pnpm-store/
 dist/
+packages/orchestrator/public/
 *.db
 *.db-journal
 .env
 .env.local
 .turbo/
 .next/
+# Conclave's own per-repository state (event store, locks) and locally built release tarballs
+.conclave/
+release/
