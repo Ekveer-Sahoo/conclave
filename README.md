@@ -1,4 +1,24 @@
-# Conclave
+<p align="center">
+  <img src="docs/images/icon.png" width="96" alt="Conclave icon">
+</p>
+
+<h1 align="center">Conclave</h1>
+
+<p align="center">
+  <b>A multi-model council that plans, audits, argues, and ratifies your coding work before it lands.</b><br>
+  Claude, Codex, Antigravity, and gateway models each judge a different concern. Nothing ships without a unanimous vote.
+</p>
+
+<p align="center">
+  <a href="#claude-code-plugin">Claude Code plugin</a> ·
+  <a href="packages/orchestrator/README.md">Operator guide</a> ·
+  <a href="#current-capabilities">Capabilities</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+<p align="center">
+  <img src="docs/images/web-ui.png" alt="The Conclave web UI showing an approved council session, its report, and the seats panel">
+</p>
 
 An event-sourced multi-model council for reviewing, planning, and executing
 coding work. A fixed panel of seats — each backed by a different model and
@@ -7,6 +27,45 @@ security, testability, performance, simplicity) — deliberates through a
 13-phase state machine, with disagreements resolved by arbitration and
 progress gated by ratification votes. Every decision is an event; state is
 always a projection over the log, never written directly.
+
+## How a council runs
+
+![The 13 phases: a plan side that drafts, audits, refines, deliberates and ratifies a plan, then a work side in an isolated worktree that executes, audits, remediates and ratifies the work. Disagreements become contentions settled by evidence, policy, or your ruling.](docs/images/council-flow.svg)
+
+Every seat audits the plan and then the work. Where seats agree something is
+wrong, it is simply fixed. Where they genuinely disagree, a contention opens: a
+neutral seat runs the claim's falsifiable test, policy weighs what's left, and a
+blocking dispute nobody can settle waits for you. Both ratification votes need
+every active seat; one REJECT or one missing vote blocks.
+
+<p align="center">
+  <img src="docs/images/deliberation.png" alt="The Deliberation tab: findings, contentions, arbitrations, verifications, and the ratification tally per round">
+  <br><sub>The Deliberation tab: findings, contentions, rulings, verifications, and every ratification vote. (Screenshots are from a demo council with stub seats, so no model was called.)</sub>
+</p>
+
+## Claude Code plugin
+
+Conclave ships as a [Claude Code](https://claude.com/claude-code) plugin, so you
+can convene and steer councils without leaving your session.
+
+```bash
+claude plugin marketplace add Ekveer-Sahoo/conclave
+claude plugin install conclave@conclave
+```
+
+| Command | What it does |
+| --- | --- |
+| `/conclave:run "<task>"` | Convene a council in the background |
+| `/conclave:status [id]` | State, deliberation summary, and the next step |
+| `/conclave:arbitrate <id>` | Explain disputes waiting on you and record your ruling |
+| `/conclave:resume <id>` · `/conclave:cancel <id>` | Continue or stop a session |
+| `/conclave:apply <id>` | Preview, then apply ratified work to a non-git folder |
+| `/conclave:seats` · `/conclave:doctor` | Inspect seats and check providers |
+| `/conclave:web` · `/conclave:list` · `/conclave:prune` | Web UI, session list, cleanup |
+
+The plugin drives the `conclave` CLI, so install that first (see the
+[operator guide](packages/orchestrator/README.md)). Details are in
+[`plugins/conclave/README.md`](plugins/conclave/README.md).
 
 ## Operator guide
 
