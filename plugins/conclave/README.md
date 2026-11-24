@@ -28,7 +28,7 @@ The marketplace entry lives at the repository root in `.claude-plugin/marketplac
 2. Add the plugin to Claude Code:
 
    ```bash
-   claude plugin marketplace add /path/to/conclave
+   claude plugin marketplace add Ekveer-Sahoo/conclave
    claude plugin install conclave@conclave
    ```
 
