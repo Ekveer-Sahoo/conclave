@@ -1,0 +1,10 @@
+{
+  "name": "conclave",
+  "version": "0.1.0",
+  "description": "Convene a multi-model council (Claude, Codex, Antigravity, gateway seats) to plan, audit, arbitrate, and ratify coding work from inside Claude Code.",
+  "author": {
+    "name": "Conclave Contributors"
+  },
+  "license": "MIT",
+  "keywords": ["council", "review", "multi-model", "arbitration", "code-review", "planning"]
+}
