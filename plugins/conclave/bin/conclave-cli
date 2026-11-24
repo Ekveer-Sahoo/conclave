@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Resolve and run the Conclave CLI (or the web server with --web).
+#
+# Lookup order:
+#   1. $CONCLAVE_BIN / $CONCLAVE_WEB_BIN   explicit executable
+#   2. `conclave` / `conclave-web` on PATH  (npm install -g of the release tarballs)
+#   3. $CONCLAVE_REPO/packages/orchestrator/dist/...   a built checkout
+#   4. the checkout this plugin lives in    (when loaded with --plugin-dir from the repo)
+set -euo pipefail
+
+mode=cli
+if [[ "${1:-}" == "--web" ]]; then
+  mode=web
+  shift
+fi
+
+if [[ "$mode" == web ]]; then
+  explicit="${CONCLAVE_WEB_BIN:-}"; on_path=conclave-web; entry=dist/web.js
+else
+  explicit="${CONCLAVE_BIN:-}"; on_path=conclave; entry=dist/cli/index.js
+fi
+
+if [[ -n "$explicit" ]]; then
+  exec "$explicit" "$@"
+fi
+
+if command -v "$on_path" >/dev/null 2>&1; then
+  exec "$on_path" "$@"
+fi
+
+plugin_root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+for repo in "${CONCLAVE_REPO:-}" "$plugin_root/../.."; do
+  [[ -z "$repo" ]] && continue
+  candidate="$repo/packages/orchestrator/$entry"
+  if [[ -f "$candidate" ]]; then
+    exec node "$candidate" "$@"
+  fi
+done
+
+cat >&2 <<EOF
+conclave-cli: could not find the Conclave ${mode}.
+Install it with one of:
+  npm install -g ./conclave-core-0.1.0.tgz ./conclave-orchestrator-0.1.0.tgz
+  export CONCLAVE_REPO=/path/to/conclave   (after: pnpm install && pnpm build)
+  export CONCLAVE_BIN=/path/to/conclave
+EOF
+exit 127
