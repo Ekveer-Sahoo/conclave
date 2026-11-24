@@ -1,0 +1,18 @@
+{
+  "name": "conclave",
+  "owner": {
+    "name": "Conclave Contributors"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for the Conclave multi-model council."
+  },
+  "plugins": [
+    {
+      "name": "conclave",
+      "source": "./plugins/conclave",
+      "description": "Run, monitor, arbitrate, and apply Conclave council sessions from Claude Code.",
+      "version": "0.1.0",
+      "category": "development"
+    }
+  ]
+}
