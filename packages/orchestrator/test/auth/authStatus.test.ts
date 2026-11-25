@@ -198,6 +198,7 @@ test("the CLI login probe uses the seat's configured model and flags, so doctor 
   const seat = (id: string, extra: Partial<SeatConfig> = {}): SeatConfig => ({ id, label: id, adapter: "cli", cliCommand: id, role: "CORRECTNESS", temperature: 0.2, maxTokens: 100, timeoutMs: 1000, enabled: true, tier: "standard", ...extra });
   assert.deepEqual(healthProbeArgs(seat("claude", { cliModel: "claude-sonnet-5" })).slice(-2), ["--model", "claude-sonnet-5"]);
   const codex = healthProbeArgs(seat("codex", { cliModel: "gpt-5.6-terra", cliExtraArgs: ["-c", "model_provider=openai"] }));
-  assert.deepEqual(codex, ["exec", "--sandbox", "read-only", "--color", "never", "--model", "gpt-5.6-terra", "-c", "model_provider=openai", "Reply exactly OK"], "codex's prompt must stay the final positional argument");
+  // --skip-git-repo-check: doctor and the web server can run outside any git repository.
+  assert.deepEqual(codex, ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", "--model", "gpt-5.6-terra", "-c", "model_provider=openai", "Reply exactly OK"], "codex's prompt must stay the final positional argument");
   assert.equal(healthProbeArgs(seat("claude")).includes("--model"), false, "no configured model means the CLI's own default, as before");
 });

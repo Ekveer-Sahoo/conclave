@@ -159,3 +159,54 @@ test("failure path (no cleanup call) leaves the worktree on disk with its change
 
   await git(["worktree", "remove", handle.path, "--force"], dir).catch(() => {});
 });
+
+test("a plain folder is snapshotted without being touched, and ratified changes apply back — refusing to clobber later edits", async () => {
+  const { createSnapshotRepository, applySnapshotChanges, createWorktree } = await import("../../src/worktree/worktree.ts");
+  const { mkdir, rm } = await import("node:fs/promises");
+  const previous = process.env.CONCLAVE_SNAPSHOT_DIR;
+  process.env.CONCLAVE_SNAPSHOT_DIR = await mkdtemp(join(tmpdir(), "conclave-snapshots-"));
+  const folder = await mkdtemp(join(tmpdir(), "conclave-plain-"));
+  try {
+    await writeFile(join(folder, "notes.md"), "# Notes\nline one\n");
+    await writeFile(join(folder, "old.txt"), "to be removed\n");
+    await writeFile(join(folder, ".gitignore"), "secret.env\n");
+    await writeFile(join(folder, "secret.env"), "TOKEN=x\n");
+    await mkdir(join(folder, "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(folder, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
+
+    const id = `snap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const { repository, baseCommit, fileCount } = await createSnapshotRepository(folder, id);
+    await assert.rejects(() => stat(join(folder, ".git")), "the folder never gets a .git");
+    assert.equal(fileCount, 3, "notes.md, old.txt and .gitignore; the ignored file and node_modules are left out");
+
+    const worktree = await createWorktree(repository, id, baseCommit);
+    await writeFile(join(worktree.path, "notes.md"), "# Notes\nline one\nline two\n");
+    await writeFile(join(worktree.path, "new.txt"), "brand new\n");
+    await rm(join(worktree.path, "old.txt"));
+    await execFileAsync("git", ["-c", "user.name=T", "-c", "user.email=t@l", "add", "-A"], { cwd: worktree.path });
+    await execFileAsync("git", ["-c", "user.name=T", "-c", "user.email=t@l", "commit", "-q", "-m", "ratified"], { cwd: worktree.path });
+    assert.equal(await readFile(join(folder, "notes.md"), "utf8"), "# Notes\nline one\n", "the folder is untouched until changes are applied");
+
+    const handle = { repository, baseCommit, branch: worktree.branch, target: folder };
+    const checked = await applySnapshotChanges({ ...handle, check: true });
+    assert.deepEqual(checked.map((f) => [f.path, f.change]).sort(), [["new.txt", "added"], ["notes.md", "modified"], ["old.txt", "deleted"]]);
+    assert.equal(await readFile(join(folder, "notes.md"), "utf8"), "# Notes\nline one\n", "a check writes nothing");
+
+    // Someone edits the same lines in the folder after the snapshot: applying must refuse, not clobber.
+    await writeFile(join(folder, "notes.md"), "# Notes\nrewritten by hand\n");
+    const { ApplyConflictError } = await import("../../src/worktree/worktree.ts");
+    await assert.rejects(() => applySnapshotChanges(handle), ApplyConflictError);
+    assert.equal(await readFile(join(folder, "notes.md"), "utf8"), "# Notes\nrewritten by hand\n");
+    await assert.doesNotReject(() => stat(join(folder, "old.txt")), "a refused apply changes nothing at all");
+
+    await writeFile(join(folder, "notes.md"), "# Notes\nline one\n");
+    await applySnapshotChanges(handle);
+    assert.equal(await readFile(join(folder, "notes.md"), "utf8"), "# Notes\nline one\nline two\n");
+    assert.equal(await readFile(join(folder, "new.txt"), "utf8"), "brand new\n");
+    await assert.rejects(() => stat(join(folder, "old.txt")));
+    assert.equal(await readFile(join(folder, "secret.env"), "utf8"), "TOKEN=x\n", "files outside the snapshot are left alone");
+  } finally {
+    if (previous === undefined) delete process.env.CONCLAVE_SNAPSHOT_DIR;
+    else process.env.CONCLAVE_SNAPSHOT_DIR = previous;
+  }
+});

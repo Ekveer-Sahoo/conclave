@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { commandFor, invokeCliSeat, parseCommandCaptures, jsonObject, ProviderActionDeniedError, resultErrorSummary, seatCliOptions } from "../../src/seats/cliAdapter.ts";
+import { commandFor, extractReportedModel, invokeCliSeat, parseCommandCaptures, jsonObject, ProviderActionDeniedError, resultErrorSummary, seatCliOptions } from "../../dist/seats/cliAdapter.js";
 
 const line = (obj: unknown) => JSON.stringify(obj);
 
@@ -185,4 +185,12 @@ test("a CLI that fails with nothing on stderr still explains itself: the error i
   assert.equal(resultErrorSummary(stdout), "error_max_structured_output_retries: Output does not match required schema");
   assert.equal(resultErrorSummary(""), "(no output)");
   assert.equal(resultErrorSummary("plain failure text"), "plain failure text");
+});
+
+test("the model a CLI reports actually answering is read from its output, never guessed", () => {
+  assert.equal(extractReportedModel([line({ type: "system", subtype: "init", model: "claude-sonnet-5" }), line({ type: "assistant", message: { model: "claude-sonnet-5", content: [] } })].join("\n")), "claude-sonnet-5");
+  assert.equal(extractReportedModel(line({ type: "result", modelUsage: { "claude-opus-5-5": {} } })), "claude-opus-5-5");
+  assert.equal(extractReportedModel(line({ status: "SUCCESS", model: "gemini-3.1-pro-high" })), "gemini-3.1-pro-high");
+  assert.equal(extractReportedModel(line({ type: "turn.completed", usage: {} }), "model: gpt-6-sol\n"), "gpt-6-sol");
+  assert.equal(extractReportedModel(line({ type: "turn.completed", usage: {} })), undefined);
 });

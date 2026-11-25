@@ -28,7 +28,8 @@ test("a valid config is loaded with schema defaults filled in, and saving clears
   writeFileSync(path, "{not json");
   const store = new SeatConfigStore(path);
   assert.ok(store.problem());
-  store.save([{ ...DEFAULT_CLI_SEATS[0]! }]);
+  assert.throws(() => store.save([{ ...DEFAULT_CLI_SEATS[0]! }]), /invalid/, "an invalid file is never overwritten by accident");
+  store.save([{ ...DEFAULT_CLI_SEATS[0]! }], { replaceInvalid: true });
   assert.equal(store.problem(), undefined);
 
   writeFileSync(path, JSON.stringify({ version: 7, seats: [{ id: "reviewer", label: "Reviewer", adapter: "xenia", xeniaModel: "cc/claude-haiku-4-5-20251001", role: "SECURITY" }] }));

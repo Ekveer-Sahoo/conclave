@@ -28,7 +28,7 @@ pnpm install && pnpm build
 
 This installs two executables:
 
-- `conclave` — the CLI (`run`, `list`, `status`, `resume`, `cancel`, `arbitrate`, `prune`, `doctor`).
+- `conclave` — the CLI (`run`, `list`, `status`, `resume`, `cancel`, `arbitrate`, `prune`, `apply`, `seats`, `doctor`).
 - `conclave-web` — the web UI server (backed by the same session engine and on-disk state).
 
 Conclave has no database server or external service dependency — session state lives in local
@@ -87,15 +87,23 @@ conclave resume <session-id>
 conclave cancel <session-id>       # stop a run from another terminal
 conclave arbitrate <session-id>    # show disputes waiting on you, or settle one
 conclave prune --older-than 14 --dry-run
+conclave seats                     # each seat and the model it uses (see §5)
 conclave doctor
 ```
 
 - `run` starts a session against `--cwd` (default: the current directory) and blocks until the
-  council reaches a verdict. Exit code `0` means ratified; `1` means anything else (not approved,
-  awaiting a human ruling, cancelled, errored). `--budget <usd>` sets the spend ceiling (default
-  `20`). The session id is printed to stderr as soon as the run starts.
+  council reaches a verdict. Exit code `0` means ratified; `1` means the council ran and did not
+  ratify (not approved, awaiting a human ruling, cancelled, errored); `2` means the command itself
+  was refused (a bad option, an unknown session, an invalid seat config). `--budget <usd>` sets the spend ceiling (default
+  `20`). `--model <seat>=<model>` (repeatable) switches a seat's model for this council only. The
+  session id is printed to stderr as soon as the run starts.
 - `run`, like `doctor`, uses the seat configuration at `CONCLAVE_SEAT_CONFIG_PATH` (§5), so
-  `doctor` never reports on a council other than the one `run` will use.
+  `doctor` never reports on a council other than the one `run` will use. If that file is invalid,
+  `run` refuses to start rather than convening the default seats.
+- Options are strict. `--db x` and `--db=x` both work; an unknown option (`--dryrun`), an option
+  missing its value, and a non-numeric `--budget` or `--limit` are refused with exit code `2` before
+  anything runs; `-h`/`--help` anywhere prints help and runs nothing. A task that itself starts with
+  `-` goes after `--`.
 - **`--db` is optional everywhere.** `run` registers every session in the session registry (§6),
   so `status`, `resume`, `cancel`, and `arbitrate` find a session's event store from any directory.
   Without a registry entry they fall back to `<cwd>/.conclave/events.db`. `list` and `prune`
@@ -108,7 +116,8 @@ conclave doctor
 - `--allow-dirty-source` permits running against a working tree with uncommitted changes (normally
   refused — see §8). Conclave's own `.conclave/` directory never counts as uncommitted.
 - `Ctrl-C` during `run`/`resume` cancels the session gracefully (see §7) rather than killing it
-  mid-write.
+  mid-write. So does closing the terminal (SIGHUP): the seats' own processes are stopped with it
+  rather than left running.
 
 ### Web
 
@@ -116,7 +125,13 @@ conclave doctor
 conclave-web            # listens on 127.0.0.1:4317 by default
 ```
 
-Open `http://127.0.0.1:4317`. Send a task to convene the council; the session's activity streams
+Open `http://127.0.0.1:4317`. Choose the folder in the New council sheet by typing a path (`~`
+works), picking a recently used one, or **Browse…**-ing your folders (git repositories are marked).
+The sheet says what you picked as you pick it. A subfolder of a repository means its whole
+repository. A repository with uncommitted changes can still be used by ticking "Run anyway"; the
+council works from your last commit either way, so those changes are not part of what it sees. Any
+other folder works too — see [Folders that aren't git repositories](#folders-that-arent-git-repositories).
+Send a task to convene the council; the session's activity streams
 live over Server-Sent Events. For any session you can see its findings, contentions and their
 threads, arbitration rulings, verification runs, and ratification tallies; cancel it while it runs;
 resume it when it's orphaned, cancelled, errored, or no longer waiting on you; and settle escalated
@@ -125,12 +140,46 @@ any adapter) with their health; health is checked on load and when you click **R
 a timer, because a CLI health probe is a billed model call. The web UI and the CLI share the same
 session registry, so sessions started from either show up in both.
 
+### Folders that aren't git repositories
+
+Conclave isolates the council's work with git, but your folder doesn't need to be a repository.
+For a plain folder (or a repository with no commits yet), Conclave takes a private snapshot of it —
+a git repository under `~/.conclave/snapshots/<session-id>` (or `CONCLAVE_SNAPSHOT_DIR`), built by
+reading your folder without writing to it; your folder never gets a `.git`. The snapshot honours any
+`.gitignore` in the folder and leaves out `node_modules`, virtualenvs and caches. It refuses, before
+copying anything, a folder of more than 50,000 files or 1 GB (add a `.gitignore`), a folder that
+contains other git repositories (run Conclave on each one instead: a snapshot cannot include them),
+and a folder with symlinks that point outside it (a seat could edit the real files through them).
+The council then runs exactly as it does on a repository, and your folder is not modified.
+
+A folder inside a git repository runs on that repository when it is the repository's content — its
+root, or a folder with tracked files. A folder the repository ignores or doesn't track (a project
+under a dotfiles-managed home, say) runs on a snapshot instead, so the council sees its files.
+
+Ratified work stays in the snapshot until you apply it:
+
+```bash
+conclave apply <session-id> --check    # list what would change, write nothing
+conclave apply <session-id>
+```
+
+or **Apply to folder** in the web UI, which previews the files first (`--dry-run` is an alias for
+`--check`). Applying writes exactly the council's changes against the snapshot it started from. If
+you edited any of the same lines in the meantime, it refuses, names the files, and writes nothing; if
+a write fails partway (a read-only file, a full disk), every file is put back. A session's changes
+can be applied once, and two applies of the same session cannot run at the same time.
+`conclave prune` removes unratified snapshot sessions' worktrees and their snapshots.
+
 ## 4. Budgets, spend limits, and approval
 
 - **Per-session budget ceiling** — default $20, `--budget` on the CLI or `budgetCeilingUsd` when
   embedding. Spend is taken from the provider's own reported usage (or the gateway's cost header
-  for Xenia seats), falling back to a local estimate. A session that crosses its ceiling stops and
-  concludes **NOT APPROVED** with the reason recorded; it is not treated as a crash.
+  for Xenia seats), falling back to a local estimate. A call that failed but was billed (a timeout,
+  an unusable answer) is charged what the provider reported; a call whose provider reported no usage
+  is charged a conservative estimate (its prompt plus its whole output allowance), never zero.
+  Every call is recorded before the ceiling is checked, no new call starts once it is reached, and
+  a session that crosses it concludes **NOT APPROVED** with the reason recorded; it is not treated as
+  a crash, and it cannot be resumed (start a new council with a higher `--budget`).
 - **Rolling spend limits across all sessions** — `POST /api/chat` (the web UI) enforces a 5-hour
   and a weekly ceiling before starting a new run, returning HTTP `429` once reached:
   `CONCLAVE_LIMIT_5H_USD` (default `10`) and `CONCLAVE_LIMIT_WEEKLY_USD` (default `50`). Calls whose
@@ -145,9 +194,12 @@ every currently-active seat to vote, with a minimum quorum of `min(2, configured
 - **`APPROVE_WITH_CHANGES` ratifies only when nothing is still open.**
 - Any **open BLOCKER or MAJOR contention blocks ratification** outright.
 
+A failed vote is not the end of the round: the dissenting seats' objections go to the executor as a
+remediation round (plan side: a refinement), and the council votes again, within the round caps.
+
 A seat that fails a call drops out of the council for the rest of the run rather than blocking it —
 but if fewer than the minimum quorum remain, the run stops with an explicit error rather than
-approving on partial input.
+approving on partial input. A resume gives every configured seat another chance.
 
 ### Disagreement, verification, and arbitration
 
@@ -162,8 +214,9 @@ Each contention is settled in this order:
    It only counts as evidence if a command demonstrably executed: a reproduction upholds the claim,
    a clean run dismisses it, anything else is inconclusive. Up to three such verifications run per
    deliberation round.
-2. **A human ruling**, if you have already given one for this contention (see below). Later rounds
-   honor it instead of re-arbitrating the same dispute.
+2. **A human ruling**, if you have already given one on these same claims (see below). Later rounds
+   honor it instead of re-arbitrating the same dispute. A ruling covers the claims it was made on:
+   a different problem later found in the same file is arbitrated on its own merits.
 3. **Weighted policy**: severity × confidence against the dissenting seats.
 4. **A contested BLOCKER is never auto-dismissed.** If the evidence and weights are inconclusive, it
    escalates to `HUMAN_ARBITRATION` and keeps blocking approval.
@@ -181,8 +234,10 @@ conclave resume <session-id>
 
 Upholding means the objection is valid and must be fixed; dismissing means it is not. Either way
 your reason is shown to every seat in later rounds, so a dismissed objection is not simply raised
-again. A session awaiting a ruling refuses to resume until every escalated contention has one. You
-can also rule while a session is still running; the next deliberation round picks it up.
+again. When you uphold one, the resumed session starts by fixing it (a plan refinement or a
+remediation round) and gets one more round to do so. A session awaiting a ruling refuses to resume
+until every escalated contention has one. You can also rule while a session is still running; the
+next deliberation round picks it up.
 
 ## 5. Configuring seats
 
@@ -190,8 +245,12 @@ Seat configuration is a JSON file at `CONCLAVE_SEAT_CONFIG_PATH` (default
 `~/.conclave/seat-config.json`), editable directly or via the web UI (`GET`/`PUT /api/seats`). The
 default is `DEFAULT_CLI_SEATS` from `@conclave/core` (`claude`, `codex`, `antigravity`). The file is
 `{"version": <number>, "seats": [...]}` and every seat is validated against the seat schema when it
-is loaded: an invalid file is ignored in favor of the defaults, and `doctor` and the web UI both say
-so.
+is loaded. An invalid file is reported by `doctor` and the web UI, and nothing uses the fallback
+defaults silently: `conclave run` refuses to start, `doctor` probes nothing, and a `conclave seats`
+change or a web UI save refuses to overwrite it (`--replace-invalid` does so deliberately, keeping the
+old file as `seat-config.json.invalid-<time>`). Unknown settings (usually typos) are reported as
+warnings. The CLI and the web server share the file: each picks up the other's saves, and a save
+based on a version that has since changed is refused rather than overwriting it.
 
 Each seat's `adapter` selects how it is invoked:
 
@@ -202,6 +261,41 @@ Each seat's `adapter` selects how it is invoked:
 | `fake` | Deterministic in-process stub. Approves unless scripted otherwise. | For tests and dry runs — contacts no provider and spends nothing. |
 
 A council can mix adapters, e.g. the `claude` CLI seat plus Xenia reviewers from `DEFAULT_SEATS`.
+
+### Switching models
+
+Every seat's model can be changed without editing JSON, and every change can be tried first:
+
+```bash
+conclave seats                          # each seat, on/off, and its model ("default model" = the CLI's own)
+conclave seats models codex             # what codex can switch to, and where that list comes from
+conclave seats set codex gpt-6-sol      # applies to new councils
+conclave seats test codex               # one small, billed call with exactly the flags a run uses
+conclave seats reset codex              # back to the CLI's default model
+conclave run "…" --model claude=claude-opus-5-5   # this council only
+```
+
+Where each seat's list comes from:
+
+| Seat | List | Notes |
+| --- | --- | --- |
+| Xenia seats | The gateway's `/v1/models` | Authoritative: an unlisted id is refused unless you pass `--force`. Listed is not the same as working — test it. |
+| Antigravity | `agy models` | Authoritative. |
+| Codex | When `~/.codex/config.toml` routes Codex through a custom provider (e.g. a gateway), that provider's `/models`, as the bare ids Codex sends; otherwise Codex's own model cache for your account. The config's `model` is shown as the default. | Any id Codex accepts works. |
+| Claude | Known Claude model ids and the `fable`/`opus`/`sonnet`/`haiku` aliases | Claude Code has no list command. Aliases follow your Claude Code settings, which can remap them; a full id is exact. |
+
+In the web UI, Council settings has a model dropdown listing the seat's whole catalog (the CLI's
+default first, then the models; **Custom id…** takes any other id), a note on where the list comes
+from, a warning when an authoritative list does not include a custom id, and a **Test** button (the
+same billed probe). The New council sheet's **Models for this council** section switches models
+for one council.
+
+A per-council model is recorded with the session, so resuming it uses the same models. Every seat
+call also records the model the provider **reports actually answering** — Claude Code names it in
+its output, and a gateway names the upstream it routed to — next to the model Conclave asked for.
+The seat rail and `report.md` show that model, so an alias or an `auto/*` route never hides what
+really ran. (Codex does not report its model in machine-readable output; for it, the requested or
+configured model is what is shown.)
 
 `cliModel` and `cliExtraArgs` let one Conclave seat differ from how you use that CLI day to day,
 without touching its global config. For example, if `~/.claude/settings.json` routes Claude Code
@@ -303,8 +397,11 @@ with `--db <path>` (`status`, `resume`, `cancel`, `arbitrate` all accept it).
 - **Everything stays local by default** — sessions, chat history, and worktrees are local SQLite and
   filesystem state. Nothing is sent anywhere except to the provider CLIs and gateway you configured.
 - **Isolated execution** — changes happen in a disposable worktree, never in your checkout.
-- **HTTP hardening** — the server binds to `127.0.0.1`, caps request bodies (clean `413`), resolves
-  a session's `cwd` to its canonical real path before use, and refuses static-asset path traversal.
+- **HTTP hardening** — the server binds to `127.0.0.1` and only answers requests addressed to its own
+  loopback host, which defeats DNS rebinding. A browser request carrying any other site's `Origin` is
+  refused, so a web page you happen to visit cannot start a council, record a ruling, change seats,
+  or list your folders. Request bodies are capped (clean `413`), a session's `cwd` is resolved to its
+  canonical real path, and static-asset path traversal is refused.
 - **Retention** — event logs are kept indefinitely (they are the audit trail); preserved worktrees
   are pruned on request (§8). Treat `~/.conclave/` and each repository's `.conclave/` as data you are
   responsible for retaining or deleting.
@@ -316,7 +413,7 @@ with `--db <path>` (`status`, `resume`, `cancel`, `arbitrate` all accept it).
 | `doctor` reports `MISSING` for a CLI seat | CLI not installed / not on `PATH` | Install it (§2), re-run `doctor`. |
 | `doctor` reports `FAIL` for a CLI seat | Installed but not authenticated, or erroring | Re-run that provider's login flow (§2); check the `fix:` hint. |
 | `doctor` reports a Xenia model missing | The gateway doesn't list that `xeniaModel` | Pick one of the suggested ids (or any from `<gateway>/v1/models`). Listed doesn't guarantee the upstream answers — a first run confirms it. |
-| `doctor` reports `seat-config` invalid | A typo in `seat-config.json` | Fix the reported field; until then runs use the default seats. |
+| `doctor` reports `seat-config` invalid | A typo in `seat-config.json` | Fix the reported field; until then `run` refuses to start. |
 | A run stops AWAITING HUMAN ARBITRATION | A contested BLOCKER survived every round | `conclave arbitrate <id>`, rule on each contention, then `conclave resume <id>` (§4). |
 | A run ends NOT APPROVED "contentions unresolved" or "not ratified" | The council never converged within its round caps | Read `deliberation` in `conclave status`; the plan may be genuinely wrong or one seat miscalibrated for the task. Inspect the preserved worktree. |
 | A run stops for quorum | Too many seats failed mid-run | Fix the failing seats (`doctor`), then `conclave resume`. |

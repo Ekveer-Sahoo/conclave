@@ -29,6 +29,7 @@ export interface SeatOutcome {
   verdict: Verdict;
   usage: ProviderUsage | null;
   commandRuns: CommandCapture[];
+  model?: string;
 }
 
 /**

@@ -173,6 +173,7 @@ test("projectSession folds every event type", () => {
   assert.deepEqual(projection.verifications, [
     {
       contentionId: "contention-1",
+      seat: undefined,
       findingId: "finding-1",
       command: "npm test -- guard",
       result: "TRUE",
@@ -210,9 +211,10 @@ test("projectSession folds every event type", () => {
     // Events written before rulings carried a source are, by construction, policy rulings.
     source: "policy",
   });
+  // No RATIFY_* PhaseEntered precedes these votes in the fixture, so they belong to ballot 0.
   assert.deepEqual(projection.ratifications, [
-    { phase: "RATIFY_PLAN", round: 0, seat: "gemini", vote: "APPROVE", citedContentionId: "contention-1" },
-    { phase: "RATIFY_PLAN", round: 0, seat: "grok", missingReason: "UNAVAILABLE" },
+    { phase: "RATIFY_PLAN", round: 0, seat: "gemini", vote: "APPROVE", citedContentionId: "contention-1", ballot: 0 },
+    { phase: "RATIFY_PLAN", round: 0, seat: "grok", missingReason: "UNAVAILABLE", ballot: 0 },
   ]);
   assert.deepEqual(projection.artifacts, [{ kind: "plan", version: 2, hash: "plan-hash", path: "/tmp/plan.md" }]);
   assert.equal(projection.spentUsd, 0.25);
@@ -221,4 +223,15 @@ test("projectSession folds every event type", () => {
   assert.equal(projection.outcome, "NOT_APPROVED");
   assert.equal(projection.outcomeReason, "plan not ratified within 3 round(s)");
   assert.equal(projection.planVersion, 2);
+});
+
+test("a finding a model credited to a made-up seat is attributed to the seat whose call recorded it (older logs)", () => {
+  const seat = (id: string) => ({ id, label: id, adapter: "cli" as const, cliCommand: id, role: "CORRECTNESS" as const, temperature: 0.2, maxTokens: 100, timeoutMs: 1000, enabled: true, tier: "standard" as const });
+  const finding = { id: "F1", seat: "verifier", role: "CORRECTNESS" as const, target: "src/sum.js", category: "bug", severity: "BLOCKER" as const, description: "d", falsifiable_test: null, confidence: 0.9 };
+  const events = [
+    ["SessionConfigured", { configVersion: 1, repoPath: "/r", seats: [seat("claude"), seat("codex")], discussionRoundCap: 6, remediationRoundCap: 3, budgetCeilingUsd: 5, allowDirtySource: false }],
+    ["SeatInvoked", { correlationId: "x", seat: "codex", phase: "RATIFY_PLAN", round: 0, status: "OK" }],
+    ["FindingRecorded", { finding, phase: "RATIFY_PLAN", round: 0 }],
+  ].map(([type, payload], index) => ({ seq: index + 1, sessionId: "s", ts: "2026-09-28T00:00:00Z", ...EventEnvelopeSchema.parse({ type, payload }) }));
+  assert.equal(projectSession("s", events).findings.F1.seat, "codex");
 });

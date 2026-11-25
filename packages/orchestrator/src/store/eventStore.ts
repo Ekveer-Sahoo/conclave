@@ -37,6 +37,14 @@ export class EventStore {
     return { seq: Number(info.lastInsertRowid), sessionId, ts, type: parsed.type, payload: parsed.payload };
   }
 
+  /**
+   * Runs `work` in one write transaction (BEGIN IMMEDIATE), so a read-check-append sequence cannot
+   * interleave with another process's appends to the same store.
+   */
+  transaction<T>(work: () => T): T {
+    return this.db.transaction(work).immediate();
+  }
+
   /** Replay every event for a session in seq order, validating each against the schema. */
   replay(sessionId: string): StoredEvent[] {
     const rows = this.db

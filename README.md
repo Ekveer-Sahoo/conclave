@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/web-ui.png" alt="The Conclave web UI showing an approved council session, its report, and the seats panel">
+  <img src="docs/images/web-ui.png" alt="The Conclave web UI: councils in the sidebar, and a ratified council showing how each seat voted, its one dispute, and where the ratified work is committed">
 </p>
 
 An event-sourced multi-model council for reviewing, planning, and executing
@@ -39,8 +39,8 @@ blocking dispute nobody can settle waits for you. Both ratification votes need
 every active seat; one REJECT or one missing vote blocks.
 
 <p align="center">
-  <img src="docs/images/deliberation.png" alt="The Deliberation tab: findings, contentions, arbitrations, verifications, and the ratification tally per round">
-  <br><sub>The Deliberation tab: findings, contentions, rulings, verifications, and every ratification vote. (Screenshots are from a demo council with stub seats, so no model was called.)</sub>
+  <img src="docs/images/deliberation.png" alt="The Disputes view: Codex objects that the rate limiter is not atomic, Claude Code disagrees, a falsifiable test reproduces the claim, and the policy ruling records it">
+  <br><sub>A dispute settled by evidence: the objection, the reply, the test that reproduced it, and the ruling. (Screenshots are from a demo council with stub seats, so no model was called.)</sub>
 </p>
 
 ## Claude Code plugin

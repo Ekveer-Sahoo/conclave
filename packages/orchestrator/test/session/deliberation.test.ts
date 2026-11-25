@@ -73,7 +73,8 @@ if (id === "codex" && prompt.includes("Audit the implementation plan") && !exist
     assert.equal(opened.length, 1);
     assert.deepEqual(opened[0].targets, ["src/auth.ts"]);
     assert.equal(opened[0].severity, "BLOCKER");
-    assert.deepEqual(opened[0].findingIds, ["f-auth"]);
+    // Finding ids are namespaced by the seat that filed them, so two seats' ids can never collide.
+    assert.deepEqual(opened[0].findingIds, ["codex:f-auth"]);
 
     // Both sides of the argument are durably recorded before the ruling.
     const thread = payloads<{ author: string; stance: string }>(events, "ThreadMessageAdded");
@@ -149,7 +150,7 @@ if (prompt.includes("Repair and improve")) {
 
     // Each seat's finding is recorded as addressed by the remediation that fixed it.
     const addressed = payloads<{ findingId: string }>(events, "FindingAddressed");
-    assert.deepEqual(addressed.map((a) => a.findingId).sort(), ["f-antigravity", "f-claude", "f-codex"]);
+    assert.deepEqual(addressed.map((a) => a.findingId).sort(), ["antigravity:f-antigravity", "claude:f-claude", "codex:f-codex"]);
     assert.equal(phases.at(-1), "REPORT");
   } finally {
     if (previous === undefined) delete process.env.CONCLAVE_TEST_MARKER;

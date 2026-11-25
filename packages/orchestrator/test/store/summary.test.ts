@@ -84,3 +84,20 @@ test("plan and work ratifications are never merged into one tally", () => {
   ]);
   assert.deepEqual(summary.ratifications.map((tally) => tally.phase), ["RATIFY_PLAN", "RATIFY_WORK"]);
 });
+
+test("a re-vote in the same phase and round is its own ballot, never merged into the failed one", () => {
+  const vote = (seat: string, voteValue: "APPROVE" | "REJECT") => ev({ type: "RatificationCast", payload: { phase: "RATIFY_WORK", round: 0, seat, vote: voteValue } });
+  const summary = summarize([
+    ev({ type: "PhaseEntered", payload: { phase: "RATIFY_WORK", round: 0 } }),
+    vote("a", "APPROVE"),
+    ev({ type: "RatificationVoteMissing", payload: { phase: "RATIFY_WORK", round: 0, seat: "b", reason: "UNAVAILABLE" } }),
+    ev({ type: "PhaseEntered", payload: { phase: "WORK_REFINE", round: 0 } }),
+    ev({ type: "PhaseEntered", payload: { phase: "RATIFY_WORK", round: 0 } }),
+    vote("a", "APPROVE"),
+  ]);
+  assert.deepEqual(
+    summary.ratifications.map(({ approve, missing }) => ({ approve, missing })),
+    [{ approve: 1, missing: 1 }, { approve: 1, missing: 0 }],
+    "two ballots in round 0, not one tally reading \"2 approve\"",
+  );
+});

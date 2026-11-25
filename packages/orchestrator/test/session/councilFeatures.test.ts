@@ -129,7 +129,7 @@ test("an executed falsifiable test that reproduces a claim upholds it, overridin
   registerFakeSeat("claude", ({ prompt, findingId }) => {
     if (stepOf(prompt) !== "VERIFY") return approve;
     verifierPrompts.push(prompt);
-    assert.equal(findingId, "f-race", "a verification invocation is scoped to the finding it verifies");
+    assert.equal(findingId, "codex:f-race", "a verification invocation is scoped to the finding it verifies");
     return {
       kind: "verdict",
       verdict: { overall_verdict: "REJECT", verdict_reasoning: "ran the test: 1 failing (lost item)" },
@@ -146,13 +146,14 @@ test("an executed falsifiable test that reproduces a claim upholds it, overridin
 
   const runs = payloads<{ findingId: string; result: string; contentionId?: string; command: string }>(events, "VerificationRun");
   assert.equal(runs.length, 1);
-  assert.equal(runs[0].findingId, "f-race");
+  assert.equal(runs[0].findingId, "codex:f-race");
   assert.equal(runs[0].result, "TRUE");
   assert.ok(runs[0].contentionId);
   assert.equal(runs[0].command, "node --test test/queue.test.js");
+  assert.equal((runs[0] as { seat?: string }).seat, "claude", "the verification records which seat ran the test");
 
   const captured = payloads<{ findingId?: string; phase: string; result: string }>(events, "CommandVerificationRun");
-  assert.deepEqual(captured.map((c) => [c.findingId, c.phase, c.result]), [["f-race", "DELIBERATE", "FAIL"]]);
+  assert.deepEqual(captured.map((c) => [c.findingId, c.phase, c.result]), [["codex:f-race", "DELIBERATE", "FAIL"]]);
 
   // MAJOR at 0.8 confidence weighs 0.48 against 1.0 of dissent: policy alone would dismiss it.
   const rulings = payloads<{ ruling: string; reasoning: string; source: string }>(events, "ArbitrationRuled");
@@ -369,5 +370,71 @@ test("a seat that fails during a ratification vote blocks that vote (a missing v
   const events = readEvents(dbPath, result.sessionId);
   assert.deepEqual(payloads<{ seat: string; phase: string }>(events, "RatificationVoteMissing").map((m) => [m.phase, m.seat]), [["RATIFY_WORK", "codex"]]);
   const workVotes = events.filter((e) => e.type === "PhaseExited" && (e.payload as { phase: string }).phase === "RATIFY_WORK").map((e) => (e.payload as { outcome: string }).outcome);
-  assert.deepEqual(workVotes, ["NOT_RATIFIED", "RATIFIED"], "the vote with a missing ballot must not ratify");
+  // Not ratified, and nobody objected: the council votes again rather than remediating nothing.
+  assert.deepEqual(workVotes, ["VOTE_INCOMPLETE", "RATIFIED"], "the vote with a missing ballot must not ratify");
+});
+
+test("findings are credited to the seat that returned them, whatever the model wrote, and two seats' ids never collide", async () => {
+  const { dir, dbPath } = await setupRepo("attribution");
+  const finding = (seat: string) => ({ id: "F1", seat, role: "CORRECTNESS" as const, target: "src/x.ts", category: "style", severity: "NIT" as const, description: "nit", falsifiable_test: null, confidence: 0.5 });
+  // Both seats call their finding "F1" and claim to be someone else entirely.
+  registerFakeSeat("codex", ({ prompt }) => stepOf(prompt) === "PLAN_AUDIT" ? { kind: "verdict", verdict: { overall_verdict: "APPROVE", verdict_reasoning: "ok", findings: [finding("verifier")] } } : approve);
+  registerFakeSeat("antigravity", ({ prompt }) => stepOf(prompt) === "PLAN_AUDIT" ? { kind: "verdict", verdict: { overall_verdict: "APPROVE", verdict_reasoning: "ok", findings: [finding("plan-reviewer")] } } : approve);
+  const result = await runCouncil({ task: "t", cwd: dir, dbPath, seats: council() });
+  const findings = Object.values(getSessionStatus(dbPath, result.sessionId).findings);
+  assert.deepEqual(findings.map((f) => [f.id, f.seat]).sort(), [["antigravity:F1", "antigravity"], ["codex:F1", "codex"]]);
+});
+
+test("every seat call records the model requested and the model the provider reports answering", async () => {
+  const { dir, dbPath } = await setupRepo("models");
+  registerFakeSeat("codex", () => ({ kind: "verdict", verdict: { overall_verdict: "APPROVE", verdict_reasoning: "ok" }, model: "routed-model-7" }));
+  const result = await runCouncil({ task: "t", cwd: dir, dbPath, seats: council() });
+  const invocations = Object.values(getSessionStatus(dbPath, result.sessionId).seatInvocations);
+  assert.ok(invocations.filter((i) => i.seat === "codex").every((i) => i.model === "routed-model-7"));
+  assert.ok(invocations.filter((i) => i.seat === "claude").every((i) => i.model === undefined), "nothing reported, nothing recorded");
+  assert.match(result.report, /## Seats/);
+  assert.match(result.report, /codex\): fake seat; answered by routed-model-7/);
+});
+
+test("a plain folder (not a git repository) runs on a private snapshot; ratified work is applied to it only on request, and only once", async () => {
+  const { mkdir, readFile, stat: statPath } = await import("node:fs/promises");
+  const { applySessionChanges } = await import("../../dist/session/autonomousCouncil.js");
+  const previous = process.env.CONCLAVE_SNAPSHOT_DIR;
+  process.env.CONCLAVE_SNAPSHOT_DIR = await mkdtemp(join(tmpdir(), "conclave-snapshots-"));
+  const folder = await mkdtemp(join(tmpdir(), "conclave-plain-council-"));
+  const dbPath = join(await mkdtemp(join(tmpdir(), "conclave-plain-db-")), "events.db");
+  try {
+    await mkdir(join(folder, "src"));
+    await writeFile(join(folder, "src", "sum.js"), "export const sum = (a, b) => a - b;\n");
+    registerFakeSeat("claude", async ({ prompt, cwd }) => {
+      if (stepOf(prompt) === "EXECUTE") await writeFile(join(cwd, "src", "sum.js"), "export const sum = (a, b) => a + b;\n");
+      return approve;
+    });
+    const result = await runCouncil({ task: "fix sum", cwd: folder, dbPath, seats: council() });
+    assert.equal(result.approved, true);
+    assert.match(result.report, /conclave apply/);
+    assert.equal(await readFile(join(folder, "src", "sum.js"), "utf8"), "export const sum = (a, b) => a - b;\n", "the folder is not modified by the council");
+    await assert.rejects(() => statPath(join(folder, ".git")), "and never gets a .git");
+    const proj = getSessionStatus(dbPath, result.sessionId);
+    assert.equal(proj.worktree?.snapshot, true);
+
+    const preview = await applySessionChanges({ dbPath, sessionId: result.sessionId, check: true });
+    assert.deepEqual(preview.files, [{ path: "src/sum.js", change: "modified" }]);
+    assert.equal(await readFile(join(folder, "src", "sum.js"), "utf8"), "export const sum = (a, b) => a - b;\n", "a check writes nothing");
+
+    await applySessionChanges({ dbPath, sessionId: result.sessionId });
+    assert.equal(await readFile(join(folder, "src", "sum.js"), "utf8"), "export const sum = (a, b) => a + b;\n");
+    assert.ok(getSessionStatus(dbPath, result.sessionId).applied);
+    await assert.rejects(() => applySessionChanges({ dbPath, sessionId: result.sessionId }), /already applied/);
+  } finally {
+    if (previous === undefined) delete process.env.CONCLAVE_SNAPSHOT_DIR;
+    else process.env.CONCLAVE_SNAPSHOT_DIR = previous;
+  }
+});
+
+test("only ratified snapshot work can be applied; a git-repository session's work stays a branch to merge", async () => {
+  const { applySessionChanges } = await import("../../dist/session/autonomousCouncil.js");
+  const { dir, dbPath } = await setupRepo("apply-git");
+  const result = await runCouncil({ task: "t", cwd: dir, dbPath, seats: council() });
+  await assert.rejects(() => applySessionChanges({ dbPath, sessionId: result.sessionId }), /ran on a git repository/);
 });

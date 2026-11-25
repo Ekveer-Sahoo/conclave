@@ -3,6 +3,8 @@ import {
   CliCancelledError,
   CliInvocationError,
   VERDICT_JSON_SCHEMA,
+  parseModelJson,
+  timerMs,
   type CommandCapture,
   type ProviderUsage,
 } from "./cliAdapter.js";
@@ -50,8 +52,12 @@ export const DEFAULT_XENIA_BASE_URL = "http://localhost:20128";
 /** Environment variable holding the gateway API key. Its value is never logged or echoed. */
 export const XENIA_API_KEY_ENV = "CONCLAVE_XENIA_API_KEY";
 
+/**
+ * The gateway's origin, without a trailing slash or `/v1`: callers append `/v1/...` themselves, and
+ * an OpenAI-style base URL (`http://host:port/v1`, what Codex's own config uses) is accepted as is.
+ */
 export const xeniaBaseUrl = (override?: string): string =>
-  (override ?? process.env.CONCLAVE_XENIA_BASE_URL ?? DEFAULT_XENIA_BASE_URL).replace(/\/+$/, "");
+  (override ?? process.env.CONCLAVE_XENIA_BASE_URL ?? DEFAULT_XENIA_BASE_URL).replace(/\/+$/, "").replace(/\/v1$/, "");
 
 /** Auth header for the gateway, or none when no key is configured (the local gateway needs none). */
 export function xeniaAuthHeaders(): Record<string, string> {
@@ -166,24 +172,7 @@ function messageText(content: unknown): string {
  * array-of-parts content, and prose around a single top-level object.
  */
 export function parseXeniaContent(content: unknown): unknown {
-  const text = messageText(content)
-    .replace(/^\s*(?:<(think|thinking)>[\s\S]*?<\/\1>\s*)+/i, "")
-    .trim();
-  const attempts = [text];
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
-  if (fenced) attempts.push(fenced[1].trim());
-  const first = text.indexOf("{");
-  const last = text.lastIndexOf("}");
-  if (first !== -1 && last > first) attempts.push(text.slice(first, last + 1));
-  let lastError: unknown;
-  for (const candidate of attempts) {
-    try {
-      return JSON.parse(candidate);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("no JSON object found in response content");
+  return parseModelJson(messageText(content));
 }
 
 /** Pulls a concise message out of an OpenAI-style `{error:{message,code}}` body, else raw text. */
@@ -204,6 +193,7 @@ export async function invokeXeniaSeat(input: XeniaInvocation): Promise<{
   verdict: Verdict;
   usage: ProviderUsage | null;
   commandRuns: CommandCapture[];
+  model?: string;
 }> {
   const { seat } = input;
   if (seat.adapter !== "xenia") throw new CliInvocationError(seat.id, "seat is not a xenia adapter");
@@ -217,7 +207,7 @@ export async function invokeXeniaSeat(input: XeniaInvocation): Promise<{
   // first wins, and we distinguish them afterwards so a timeout is not reported as a cancellation.
   // The timer covers reading the body too, not just receiving headers.
   const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(), seat.timeoutMs);
+  const timer = setTimeout(() => timeoutController.abort(), timerMs(seat.timeoutMs));
   const signals = [timeoutController.signal, input.signal].filter(Boolean) as AbortSignal[];
   const combined = AbortSignal.any(signals);
 
@@ -276,16 +266,22 @@ export async function invokeXeniaSeat(input: XeniaInvocation): Promise<{
     throw new CliInvocationError(seat.id, `xenia returned no choices: ${detail.slice(0, 500).trim()}`);
   }
 
+  // The completion was billed whether or not its verdict is usable.
+  const usage = extractXeniaUsage(body, response.headers);
   try {
     const verdict = VerdictSchema.parse(parseXeniaContent(choice.message?.content));
+    // The gateway names the model it actually routed to — for an `auto/*` combo that is the only
+    // way to know which upstream answered.
+    const routed = (body as { model?: unknown }).model;
     return {
       verdict: { ...verdict, seat: seat.id },
-      usage: extractXeniaUsage(body, response.headers),
+      usage,
       // Xenia seats reason over the prompt alone; they have no shell, so they never run commands.
       commandRuns: [],
+      model: typeof routed === "string" && routed ? routed : response.headers.get("x-xenia-model") ?? undefined,
     };
   } catch (error) {
     const truncated = choice.finish_reason === "length" ? ` (finish_reason=length; maxTokens ${seat.maxTokens} too low?)` : "";
-    throw new CliInvocationError(seat.id, `invalid verdict${truncated}: ${String(error)}`);
+    throw new CliInvocationError(seat.id, `invalid verdict${truncated}: ${String(error)}`, [], usage);
   }
 }

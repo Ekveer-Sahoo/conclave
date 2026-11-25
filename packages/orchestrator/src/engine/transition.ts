@@ -24,6 +24,8 @@ export type PhaseSignal =
   | "REFINED_ACTIONABLE"
   | "RATIFIED"
   | "NOT_RATIFIED"
+  /** The vote failed only because ballots were missing (a seat's call failed): nobody objected. */
+  | "VOTE_INCOMPLETE"
   | "IMPLEMENTED"
   | "REMEDIATED"
   | "CANCELLED"
@@ -118,6 +120,12 @@ export function transition(state: TransitionState, signal: PhaseSignal): Transit
 
     case "RATIFY_PLAN":
       if (signal === "RATIFIED") return advance("EXECUTE", 0);
+      // Nothing to refine when nobody objected: vote again (the failed seats have dropped out).
+      if (signal === "VOTE_INCOMPLETE") {
+        return planRoundsExhausted
+          ? terminal("NOT_APPROVED", `plan not ratified within ${discussionRoundCap} round(s): ballots missing`)
+          : advance("RATIFY_PLAN", round + 1);
+      }
       if (signal === "NOT_RATIFIED") {
         return planRoundsExhausted
           ? terminal("NOT_APPROVED", `plan not ratified within ${discussionRoundCap} round(s)`)
@@ -166,10 +174,20 @@ export function transition(state: TransitionState, signal: PhaseSignal): Transit
 
     case "RATIFY_WORK":
       if (signal === "RATIFIED") return advance("REPORT", round);
+      // Nothing to remediate when nobody objected: vote again rather than send the executor to
+      // edit work every responding seat approved.
+      if (signal === "VOTE_INCOMPLETE") {
+        return remediationExhausted
+          ? terminal("NOT_APPROVED", `work not ratified within ${remediationRoundCap} round(s): ballots missing`)
+          : advance("RATIFY_WORK", round + 1);
+      }
       if (signal === "NOT_RATIFIED") {
+        // A failed vote is work to do, like a defective audit: remediate the dissenters' objections
+        // in the next round. (Going back to WORK_REFINE at the same round found nothing to
+        // deliberate, returned straight to the vote, and never consumed a round.)
         return remediationExhausted
           ? terminal("NOT_APPROVED", `work not ratified within ${remediationRoundCap} round(s)`)
-          : advance("WORK_REFINE", round);
+          : advance("REMEDIATE", round + 1);
       }
       break;
 
@@ -206,13 +224,15 @@ export function resumeEntry(state: {
     case "PLAN_AUDIT":
     case "DELIBERATE":
     case "PLAN_REFINE":
-      // Mid-round → redo that round. Between rounds → the next one.
-      return { phase: "PLAN_AUDIT", round: phaseOpen ? round : round };
+      // Re-audit the recorded round, whether it was interrupted or had closed: an audit is cheap to
+      // repeat and reads state, where advancing a round could skip past the round caps.
+      return { phase: "PLAN_AUDIT", round };
 
     case "RATIFY_PLAN":
-      // A ratification that never closed must be re-taken; one that closed as ratified still
-      // re-audits, because EXECUTE's completion was not durably recorded either way.
-      return phaseOpen || state.lastPhaseOutcome !== "ratified"
+      // A ratification that never closed (or closed without ratifying) is re-audited. One that
+      // closed ratified goes on to EXECUTE: had EXECUTE begun, the last phase would be EXECUTE.
+      // (The driver records the signal, "RATIFIED"; older tests fed it lowercase.)
+      return phaseOpen || state.lastPhaseOutcome?.toUpperCase() !== "RATIFIED"
         ? { phase: "PLAN_AUDIT", round }
         : { phase: "EXECUTE", round: 0 };
 

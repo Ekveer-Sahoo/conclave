@@ -12,9 +12,10 @@ export interface FakeInvocation {
 }
 
 export type FakeSeatResponse =
-  | { kind: "verdict"; verdict: Partial<Verdict> & Pick<Verdict, "overall_verdict">; usage?: ProviderUsage | null; commandRuns?: CommandCapture[] }
-  /** Rejects like a provider that failed — the seat is dropped from the active set for the run. */
-  | { kind: "error"; message: string }
+  | { kind: "verdict"; verdict: Partial<Verdict> & Pick<Verdict, "overall_verdict">; usage?: ProviderUsage | null; commandRuns?: CommandCapture[]; model?: string }
+  /** Rejects like a provider that failed — the seat is dropped from the active set for the run. A
+   * failure can still carry what the call cost (a timeout, an unusable answer are billed too). */
+  | { kind: "error"; message: string; usage?: ProviderUsage | null }
   /** Never settles until the signal aborts. Exists so cancellation paths are testable in-process. */
   | { kind: "hang" };
 
@@ -60,6 +61,7 @@ export async function invokeFakeSeat(input: FakeInvocation): Promise<{
   verdict: Verdict;
   usage: ProviderUsage | null;
   commandRuns: CommandCapture[];
+  model?: string;
 }> {
   if (input.seat.adapter !== "fake") {
     throw new CliInvocationError(input.seat.id, "seat is not a fake adapter");
@@ -74,7 +76,7 @@ export async function invokeFakeSeat(input: FakeInvocation): Promise<{
     : { kind: "verdict", verdict: { overall_verdict: "APPROVE", verdict_reasoning: `${input.seat.id} approves` } };
 
   if (response.kind === "error") {
-    throw new CliInvocationError(input.seat.id, response.message);
+    throw new CliInvocationError(input.seat.id, response.message, [], response.usage ?? null);
   }
   if (response.kind === "hang") {
     return await new Promise((_resolve, reject) => {
@@ -100,5 +102,6 @@ export async function invokeFakeSeat(input: FakeInvocation): Promise<{
     verdict,
     usage: response.usage === undefined ? DEFAULT_USAGE(input.seat.id) : response.usage,
     commandRuns: response.commandRuns ?? [],
+    model: response.model,
   };
 }
