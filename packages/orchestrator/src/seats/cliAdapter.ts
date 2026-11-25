@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { VerdictSchema, type SeatConfig, type Verdict } from "@conclave/core";
+import { redactSecrets } from "../secrets.js";
 
 export interface CliInvocation {
   seat: SeatConfig;
@@ -46,6 +47,36 @@ export interface CliSeatOutcome {
   verdict: Verdict;
   usage: ProviderUsage | null;
   commandRuns: CommandCapture[];
+  /** The model the provider reports having used, when its output says so. */
+  model?: string;
+}
+
+/**
+ * The model a CLI reports actually answering. Claude Code's stream-json names it on every assistant
+ * message (and on its init and result records); Antigravity's JSON may carry a top-level `model`;
+ * Codex's JSON events do not, but its banner line ("model: …") sometimes reaches stderr. Undefined
+ * when nothing reliable is present — never guessed from the request.
+ */
+export function extractReportedModel(stdout: string, stderr = ""): string | undefined {
+  const records = reverseLines(stdout) as Array<Record<string, unknown>>;
+  // The assistant messages name the model that wrote the answer. `result.modelUsage` also lists
+  // helper models Claude Code used along the way, so it is only a fallback — and then the model
+  // that produced the most output, not whichever key happens to come first.
+  for (const record of records) {
+    const message = record.message as Record<string, unknown> | undefined;
+    if (record.type === "assistant" && typeof message?.model === "string") return message.model;
+  }
+  for (const record of records) {
+    if (record.type === "result" && record.modelUsage && typeof record.modelUsage === "object") {
+      const outputOf = (usage: unknown) => Number((usage as Record<string, unknown> | null)?.outputTokens) || 0;
+      const [top] = Object.entries(record.modelUsage as Record<string, unknown>).sort(([, a], [, b]) => outputOf(b) - outputOf(a));
+      if (top) return top[0];
+    }
+    if (record.type === "system" && typeof record.model === "string") return record.model;
+    if (!record.type && typeof record.model === "string") return record.model;
+  }
+  const banner = /^model:\s*(\S+)\s*$/m.exec(stderr);
+  return banner?.[1];
 }
 
 const MAX_PLAUSIBLE_TOKENS = 5_000_000;
@@ -82,9 +113,12 @@ function extractClaudeUsage(stdout: string): ProviderUsage | null {
     if (record.type !== "result") continue;
     const usage = record.usage as Record<string, unknown> | undefined;
     if (!usage) return null;
-    const promptTokens = sanitizeTokenCount(usage.input_tokens);
+    const inputTokens = sanitizeTokenCount(usage.input_tokens);
     const completionTokens = sanitizeTokenCount(usage.output_tokens);
-    if (promptTokens === undefined || completionTokens === undefined) return null;
+    if (inputTokens === undefined || completionTokens === undefined) return null;
+    // Writing the prompt cache is billed input like any other (at a premium), so it counts as prompt
+    // tokens; reading it is cheaper and stays separate in cachedInputTokens.
+    const promptTokens = inputTokens + (sanitizeTokenCount(usage.cache_creation_input_tokens) ?? 0);
     return {
       promptTokens,
       completionTokens,
@@ -134,13 +168,29 @@ function extractAntigravityUsage(stdout: string): ProviderUsage | null {
   return null;
 }
 
-/** Dispatches to the provider-specific usage extractor for a seat, returning null when
- * authoritative usage is absent, malformed, or out of plausible range. */
-export function extractProviderUsage(seatId: string, stdout: string): ProviderUsage | null {
+export type CliKind = "claude" | "codex" | "antigravity" | "other";
+
+/**
+ * Which CLI a seat drives: from its id, or else its command's name — so a seat renamed to, say,
+ * "codex-mini" is still invoked, probed, metered and catalogued as Codex. Everything that depends
+ * on the CLI's flags or output format dispatches on this, never on the seat id alone.
+ */
+export function cliKind(seat: Pick<SeatConfig, "id" | "cliCommand">): CliKind {
+  const command = (seat.cliCommand ?? "").split(/[\\/]/).at(-1) ?? "";
+  if (seat.id === "claude" || command === "claude") return "claude";
+  if (seat.id === "codex" || command === "codex") return "codex";
+  if (seat.id === "antigravity" || command === "agy") return "antigravity";
+  return "other";
+}
+
+/** Dispatches to the provider-specific usage extractor for a seat (or a bare CLI kind), returning
+ * null when authoritative usage is absent, malformed, or out of plausible range. */
+export function extractProviderUsage(seat: Pick<SeatConfig, "id" | "cliCommand"> | string, stdout: string): ProviderUsage | null {
+  const kind = typeof seat === "string" ? cliKind({ id: seat }) : cliKind(seat);
   try {
-    if (seatId === "claude") return extractClaudeUsage(stdout);
-    if (seatId === "codex") return extractCodexUsage(stdout);
-    if (seatId === "antigravity") return extractAntigravityUsage(stdout);
+    if (kind === "claude") return extractClaudeUsage(stdout);
+    if (kind === "codex") return extractCodexUsage(stdout);
+    if (kind === "antigravity") return extractAntigravityUsage(stdout);
     return null;
   } catch {
     return null;
@@ -150,10 +200,16 @@ export function extractProviderUsage(seatId: string, stdout: string): ProviderUs
 export class CliInvocationError extends Error {
   seatId: string;
   commandRuns: CommandCapture[];
-  constructor(seatId: string, message: string, commandRuns: CommandCapture[] = []) {
+  /**
+   * What the provider reports the failed call cost, when it said. A call that times out, exits
+   * non-zero or returns an unusable verdict is still billed, and must still count against the budget.
+   */
+  usage: ProviderUsage | null;
+  constructor(seatId: string, message: string, commandRuns: CommandCapture[] = [], usage: ProviderUsage | null = null) {
     super(`${seatId}: ${message}`);
     this.seatId = seatId;
     this.commandRuns = commandRuns;
+    this.usage = usage;
   }
 }
 
@@ -166,7 +222,7 @@ export class CliCancelledError extends CliInvocationError {}
  * that entire group, which also reaches any grandchildren the CLI tool itself spawns (wrapper
  * scripts, npx, etc.) that `child.kill()` alone would silently orphan.
  */
-function killProcessTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+export function killProcessTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
   if (child.pid == null) return;
   try {
     process.kill(-child.pid, signal);
@@ -253,6 +309,9 @@ const VERIFICATION_COMMAND_PREFIXES = [
   "pnpm test",
   "pnpm typecheck",
   "pnpm build",
+  // Python repositories: the unittest/pytest runners are the equivalent of `node --test`.
+  "python3 -m unittest",
+  "python3 -m pytest",
 ];
 
 const AUDIT_ALLOWED_BASH = VERIFICATION_COMMAND_PREFIXES.flatMap((prefix) => [`Bash(${prefix})`, `Bash(${prefix} *)`]);
@@ -264,7 +323,9 @@ const AUDIT_ALLOWED_BASH = VERIFICATION_COMMAND_PREFIXES.flatMap((prefix) => [`B
 const VERIFICATION_GUIDANCE =
   "\n\nWhen verifying behavior, add or use a checked-in test file and run it with `node --test` " +
   "(e.g. `node --test path/to/file.test.js`). Do not run `node -e` or any other inline JavaScript " +
-  "one-liner to check behavior — it is not permitted here and will be denied.";
+  "one-liner to check behavior — it is not permitted here and will be denied. In a Python repository " +
+  "use `python3 -m unittest` (or `python3 -m pytest`) against checked-in tests instead; `python3 -c` and " +
+  "running arbitrary scripts are likewise denied.";
 
 /** Structural (whole-token) prefix match, not substring — "rg" must not match inside "argument". */
 function isAllowlistedVerificationCommand(command: string): boolean {
@@ -302,10 +363,12 @@ export function commandFor(seat: SeatConfig, prompt: string, mode: "audit" | "ex
   const command = seat.cliCommand;
   if (!command) throw new CliInvocationError(seat.id, "cliCommand is required");
   if (seat.cliArgsTemplate?.length) {
-    return { command, args: seat.cliArgsTemplate.map((arg) => arg.replaceAll("{prompt}", prompt)) };
+    // A replacer function, not a string: prompts carry code, and a string replacement would expand
+    // `$&`, `$$`, `` $` `` and `$'` in it.
+    return { command, args: seat.cliArgsTemplate.map((arg) => arg.replaceAll("{prompt}", () => prompt)) };
   }
   const modelArgs = seatCliOptions(seat);
-  switch (seat.id) {
+  switch (cliKind(seat)) {
     case "claude": {
       // stream-json + --verbose exposes the tool_use/tool_result transcript needed to capture
       // which verification commands actually ran, alongside the same final result envelope
@@ -345,6 +408,29 @@ export function commandFor(seat: SeatConfig, prompt: string, mode: "audit" | "ex
  * produced a badly-shaped answer — callers should classify this as unavailable, not malformed. */
 export class ProviderActionDeniedError extends Error {}
 
+/**
+ * The JSON object a model wrote as its answer, tolerating what models add despite being told not
+ * to: a leading `<think>` block, a ```json fence, or prose around a single top-level object.
+ */
+export function parseModelJson(raw: string): unknown {
+  const text = raw.replace(/^\s*(?:<(think|thinking)>[\s\S]*?<\/\1>\s*)+/i, "").trim();
+  const attempts = [text];
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+  if (fenced) attempts.push(fenced[1]!.trim());
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first !== -1 && last > first) attempts.push(text.slice(first, last + 1));
+  let lastError: unknown;
+  for (const candidate of attempts) {
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("no JSON object found in the answer");
+}
+
 export function jsonObject(text: string): { output: unknown; permissionDenials: unknown[] } {
   const lines = text.trim().split(/\r?\n/).reverse();
   for (const line of lines) {
@@ -361,7 +447,7 @@ export function jsonObject(text: string): { output: unknown; permissionDenials: 
     if (record.result && typeof record.result === "object") return { output: record.result, permissionDenials };
     if (record.type === "item.completed") {
       const item = record.item as Record<string, unknown> | undefined;
-      if (item?.type === "agent_message" && typeof item.text === "string") return { output: JSON.parse(item.text), permissionDenials };
+      if (item?.type === "agent_message" && typeof item.text === "string") return { output: parseModelJson(item.text), permissionDenials };
     }
     if (record.overall_verdict) return { output: record, permissionDenials };
     if (Array.isArray(record.denied_actions) && record.denied_actions.length > 0) {
@@ -371,23 +457,44 @@ export function jsonObject(text: string): { output: unknown; permissionDenials: 
       throw new ProviderActionDeniedError(`provider denied required action(s) and returned no verdict: ${denied}`);
     }
   }
+  // A CLI that ran its turn to completion but wrote no answer at all (Codex emits `turn.completed`
+  // with zero output tokens when one of the operator's own UserPromptSubmit hooks blocks the prompt)
+  // is not a malformed verdict: the model never saw the prompt. Say so, instead of failing below
+  // with a JSON syntax error about the event stream.
+  const sawTurnCompleted = lines.some((line) => /"type"\s*:\s*"turn\.completed"/.test(line));
+  const sawAgentMessage = lines.some((line) => /"type"\s*:\s*"agent_message"/.test(line));
+  if (sawTurnCompleted && !sawAgentMessage) {
+    throw new ProviderActionDeniedError(
+      "the CLI completed its turn without writing any answer (no agent message, zero output tokens) — " +
+        "a prompt hook or provider policy most likely blocked the prompt before the model saw it",
+    );
+  }
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
-  if (start >= 0 && end > start) return { output: JSON.parse(text.slice(start, end + 1)), permissionDenials: [] };
+  if (start >= 0 && end > start) {
+    try {
+      return { output: JSON.parse(text.slice(start, end + 1)), permissionDenials: [] };
+    } catch {
+      throw new Error("provider output contained no verdict object");
+    }
+  }
   throw new Error("provider returned no JSON object");
 }
 
 const MAX_CAPTURED_OUTPUT_CHARS = 4000;
-const SECRET_PATTERNS: RegExp[] = [
-  /(?:api[_-]?key|secret|token|password|passwd|authorization)\s*[:=]\s*\S+/gi,
-  /\bsk-[A-Za-z0-9]{16,}\b/g,
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\bghp_[A-Za-z0-9]{20,}\b/g,
-];
+
+/** The end of a failed CLI's stderr, redacted and bounded: the end is where the error is. */
+function errorTail(raw: string, max = 2_000): string {
+  const text = redactSecrets(raw.trim(), "[REDACTED]");
+  return text.length > max ? `…${text.slice(-max)}` : text;
+}
+
+/** setTimeout fires at once for delays above 2^31-1 ms; a longer seat timeout is capped there. */
+export const MAX_TIMER_MS = 2_147_483_647 - 10_000;
+export const timerMs = (ms: number) => Math.min(Math.max(0, ms), MAX_TIMER_MS);
 
 function sanitizeOutput(raw: string): string {
-  let text = raw;
-  for (const pattern of SECRET_PATTERNS) text = text.replace(pattern, "[REDACTED]");
+  let text = redactSecrets(raw, "[REDACTED]");
   if (text.length > MAX_CAPTURED_OUTPUT_CHARS) {
     text = `${text.slice(0, MAX_CAPTURED_OUTPUT_CHARS)}\n…[truncated ${text.length - MAX_CAPTURED_OUTPUT_CHARS} chars]`;
   }
@@ -511,10 +618,35 @@ export function parseCommandCaptures(rawStdout: string, permissionDenials: unkno
   return captures;
 }
 
+/** Provider-side failures that are worth one more try: the request never reached a model, or the
+ * provider said it was momentarily unable to serve it. Timeouts and cancellations are not retried. */
+const TRANSIENT_FAILURE = /\b(NOT_FOUND|code 404|code 429|code 500|code 502|code 503|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up)\b/i;
+
+export function isTransientCliFailure(error: unknown): boolean {
+  if (!(error instanceof CliInvocationError) || error instanceof CliCancelledError) return false;
+  if (/timed out after \d+ms/.test(error.message)) return false;
+  return /exited /.test(error.message) && TRANSIENT_FAILURE.test(error.message);
+}
+
+/**
+ * One seat invocation, retried once when the provider failed transiently. A single 404/429/503 from
+ * a provider used to eject the seat for the rest of the session, which with three seats is usually
+ * enough to lose quorum.
+ */
 export async function invokeCliSeat(input: CliInvocation): Promise<CliSeatOutcome> {
+  try {
+    return await invokeCliSeatOnce(input);
+  } catch (error) {
+    if (!isTransientCliFailure(error) || input.signal?.aborted) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    return await invokeCliSeatOnce(input);
+  }
+}
+
+async function invokeCliSeatOnce(input: CliInvocation): Promise<CliSeatOutcome> {
   if (input.seat.adapter !== "cli") throw new CliInvocationError(input.seat.id, "seat is not a CLI adapter");
   const { command, args } = commandFor(input.seat, input.prompt, input.mode ?? "audit");
-  const timeoutMs = input.seat.timeoutMs;
+  const timeoutMs = timerMs(input.seat.timeoutMs);
   const captures = (stdout: string, permissionDenials: unknown[] = []): CommandCapture[] =>
     parseCommandCaptures(stdout, permissionDenials).map((capture) =>
       input.findingId ? { ...capture, findingId: input.findingId } : capture,
@@ -558,9 +690,11 @@ export async function invokeCliSeat(input: CliInvocation): Promise<CliSeatOutcom
     });
     child.on("close", (code, signal) => {
       cleanup();
-      if (cancelled) return reject(new CliCancelledError(input.seat.id, "cancelled", captures(stdout)));
-      if (timedOut) return reject(new CliInvocationError(input.seat.id, `timed out after ${timeoutMs}ms`, captures(stdout)));
-      if (code !== 0) return reject(new CliInvocationError(input.seat.id, `exited ${code ?? signal}: ${stderr.trim() || resultErrorSummary(stdout)}`, captures(stdout)));
+      // Whatever the provider says this call cost is charged even when the call failed.
+      const usage = extractProviderUsage(input.seat, stdout);
+      if (cancelled) return reject(new CliCancelledError(input.seat.id, "cancelled", captures(stdout), usage));
+      if (timedOut) return reject(new CliInvocationError(input.seat.id, `timed out after ${timeoutMs}ms`, captures(stdout), usage));
+      if (code !== 0) return reject(new CliInvocationError(input.seat.id, `exited ${code ?? signal}: ${errorTail(stderr) || resultErrorSummary(stdout)}`, captures(stdout), usage));
       try {
         const { output, permissionDenials } = jsonObject(stdout);
         // A denied command is recorded (as a DENIED capture, which never counts as evidence) but
@@ -568,13 +702,13 @@ export async function invokeCliSeat(input: CliInvocation): Promise<CliSeatOutcom
         // — ejecting it from the council — over one command outside the allowlist is far worse.
         const commandRuns = captures(stdout, permissionDenials);
         const verdict = VerdictSchema.parse(output);
-        const usage = extractProviderUsage(input.seat.id, stdout);
-        resolve({ verdict: { ...verdict, seat: input.seat.id }, usage, commandRuns });
+        resolve({ verdict: { ...verdict, seat: input.seat.id }, usage, commandRuns, model: extractReportedModel(stdout, stderr) });
       } catch (error) {
         if (error instanceof ProviderActionDeniedError) {
-          return reject(new CliInvocationError(input.seat.id, error.message, captures(stdout)));
+          return reject(new CliInvocationError(input.seat.id, error.message, captures(stdout), usage));
         }
-        reject(new CliInvocationError(input.seat.id, `invalid verdict: ${String(error)}; stderr: ${stderr.trim()}`, captures(stdout)));
+        const tail = errorTail(stderr);
+        reject(new CliInvocationError(input.seat.id, `invalid verdict: ${String(error)}${tail ? `; stderr: ${tail}` : ""}`, captures(stdout), usage));
       }
     });
   });

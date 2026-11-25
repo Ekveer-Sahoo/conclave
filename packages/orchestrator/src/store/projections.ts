@@ -16,6 +16,7 @@ import {
   SessionConfiguredEvent,
   SessionResumedEvent,
   SessionConcludedEvent,
+  ChangesAppliedEvent,
   type Finding,
   type Phase,
   type SeatConfig,
@@ -48,6 +49,7 @@ type SessionConcluded = Payload<typeof SessionConcludedEvent>;
 type Worktree = WorktreeCreated & {
   treeHashes: Partial<Record<"before" | "after", string>>;
 };
+type ChangesApplied = Payload<typeof ChangesAppliedEvent>;
 type FindingProjection = Finding & {
   addressed?: Pick<FindingAddressed, "artifactVersion" | "resolution">;
 };
@@ -59,18 +61,24 @@ type ContentionProjection = {
   findingIds: ContentionOpened["findingIds"];
   thread: Array<Pick<ThreadMessageAdded, "author" | "stance" | "reasoning" | "evidence">>;
 };
-type SeatInvocationProjection = Pick<SeatInvoked, "seat" | "phase" | "round" | "status"> & {
+type SeatInvocationProjection = Pick<SeatInvoked, "seat" | "phase" | "round" | "status" | "requestedModel" | "model"> & {
   verdict?: Verdict;
 };
 type VerificationProjection = VerificationRun;
 type CommandVerificationProjection = CommandVerificationRun;
-type ArbitrationProjection = Omit<ArbitrationRuled, "contentionId">;
+type ArbitrationProjection = Omit<ArbitrationRuled, "contentionId"> & {
+  /** The claims ruled on (from the event, or for older logs the contention's findings at the time). */
+  findingIds?: string[];
+};
+/** One ruling in the order it was made. */
+export type ArbitrationLogEntry = ArbitrationProjection & { contentionId: string };
 export type SessionOutcome = SessionConcluded["outcome"];
-type RatificationProjection =
+type RatificationProjection = (
   | RatificationCast
   | (Omit<RatificationVoteMissing, "reason"> & {
       missingReason: RatificationVoteMissing["reason"];
-    });
+    })
+) & { ballot: number };
 type ArtifactProjection = ArtifactWritten;
 type ResumeProjection = SessionResumed & { ts?: string };
 
@@ -91,6 +99,8 @@ export interface SessionProjection {
   worktree?: Worktree;
   worktreeRemoved?: WorktreeRemoved;
   worktreeKept?: WorktreeKept;
+  /** When ratified changes were written into the plain folder a snapshot session ran against. */
+  applied?: ChangesApplied & { at: string };
   lastPhaseOutcome?: string;
   /** The council's verdict, once one is reached. Cleared by a resume. */
   outcome?: SessionOutcome;
@@ -103,13 +113,24 @@ export interface SessionProjection {
   planText?: string;
   planVersion: number;
   spentUsd: number;
+  /** Spend attributed to each seat, from the same BudgetSpent events as `spentUsd`. */
+  spendBySeat: Record<string, number>;
+  /** Timestamps of the first and most recent event: when the session started and last did anything. */
+  startedAt?: string;
+  updatedAt?: string;
   resumes: ResumeProjection[];
   seatInvocations: Record<string, SeatInvocationProjection>;
   findings: Record<string, FindingProjection>;
   contentions: Record<string, ContentionProjection>;
   verifications: VerificationProjection[];
   commandVerifications: CommandVerificationProjection[];
+  /** The latest ruling per contention. */
   arbitrations: Record<string, ArbitrationProjection>;
+  /**
+   * Every ruling, in order. Several claims can share a contention id (it is a hash of the file), so
+   * a later policy ruling on one claim must not erase a human's ruling on another.
+   */
+  arbitrationLog: ArbitrationLogEntry[];
   ratifications: RatificationProjection[];
   artifacts: ArtifactProjection[];
   errored: boolean;
@@ -125,12 +146,14 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
     currentRound: 0,
     planVersion: 0,
     spentUsd: 0,
+    spendBySeat: {},
     seatInvocations: {},
     findings: {},
     contentions: {},
     verifications: [],
     commandVerifications: [],
     arbitrations: {},
+    arbitrationLog: [],
     ratifications: [],
     artifacts: [],
     errored: false,
@@ -138,6 +161,16 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
     phaseOpen: false,
     resumes: [],
   };
+
+  /** Increments on every vote opened, so a re-vote in the same phase and round is its own ballot. */
+  let ballot = 0;
+  /**
+   * The seat whose call was recorded most recently. The driver always appends a seat's SeatInvoked
+   * immediately followed by that seat's FindingRecorded events, so this is who filed the findings
+   * that follow — which lets logs written before findings were attributed at record time still
+   * credit each finding to a real seat instead of whatever name the model wrote.
+   */
+  let lastInvokedSeat: string | undefined;
 
   const contention = (contentionId: string): ContentionProjection => {
     const existing = proj.contentions[contentionId];
@@ -155,6 +188,8 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
 
   for (const ev of events) {
     const p = ev.payload as Record<string, unknown>;
+    proj.startedAt ??= ev.ts;
+    proj.updatedAt = ev.ts;
     switch (ev.type) {
       case "SessionCreated":
         proj.task = p.task as string;
@@ -189,6 +224,8 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
           baseCommit: p.baseCommit as string,
           branch: p.branch as string,
           path: p.path as string,
+          ...(typeof p.repository === "string" ? { repository: p.repository } : {}),
+          ...(p.snapshot === true ? { snapshot: true } : {}),
           treeHashes: {},
         };
         break;
@@ -204,6 +241,7 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
         proj.worktreeKept = { reason: p.reason as string };
         break;
       case "PhaseEntered":
+        if (p.phase === "RATIFY_PLAN" || p.phase === "RATIFY_WORK") ballot += 1;
         proj.currentPhase = p.phase as Phase;
         proj.currentRound = p.round as number;
         proj.phaseOpen = true;
@@ -215,19 +253,24 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
         }
         break;
       case "SeatInvoked":
+        lastInvokedSeat = p.seat as string;
         proj.seatInvocations[p.correlationId as string] = {
           seat: p.seat as string,
           phase: p.phase as Phase,
           round: p.round as number,
           status: p.status as SeatInvocationProjection["status"],
           verdict: p.verdict as Verdict | undefined,
+          requestedModel: p.requestedModel as string | undefined,
+          model: p.model as string | undefined,
         };
         if ((p.phase === "PLAN" || p.phase === "PLAN_REFINE") && p.status === "OK" && p.verdict) {
           proj.planText = (p.verdict as Verdict).verdict_reasoning;
         }
         break;
       case "FindingRecorded": {
-        const f = p.finding as Finding;
+        const recorded = p.finding as Finding;
+        const knownSeat = proj.seats?.some((seat) => seat.id === recorded.seat) ?? true;
+        const f = knownSeat || !lastInvokedSeat ? recorded : { ...recorded, seat: lastInvokedSeat };
         proj.findings[f.id] = f;
         break;
       }
@@ -246,6 +289,9 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
         // Contention ids are derived from the target, so the same dispute re-detected in a later
         // round reopens the existing record rather than leaving its previous ruling in place.
         opened.status = "OPEN";
+        // The thread is the argument about the claims now in dispute; an earlier claim on the same
+        // file (and its thread) is a different dispute.
+        opened.thread = [];
         opened.targets = p.targets as string[];
         opened.category = p.category as string;
         opened.severity = p.severity as ContentionProjection["severity"];
@@ -263,6 +309,7 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
       case "VerificationRun":
         proj.verifications.push({
           contentionId: p.contentionId as string | undefined,
+          seat: p.seat as string | undefined,
           findingId: p.findingId as string,
           command: p.command as string,
           result: p.result as VerificationProjection["result"],
@@ -282,14 +329,19 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
           findingId: p.findingId as string | undefined,
         });
         break;
-      case "ArbitrationRuled":
-        proj.arbitrations[p.contentionId as string] = {
+      case "ArbitrationRuled": {
+        const findingIds = (p.findingIds as string[] | undefined) ?? (p.source === "human" ? [...(proj.contentions[p.contentionId as string]?.findingIds ?? [])] : undefined);
+        const ruling: ArbitrationProjection = {
           arbiters: p.arbiters as string[],
           ruling: p.ruling as string,
           reasoning: p.reasoning as string,
           source: (p.source as ArbitrationProjection["source"] | undefined) ?? "policy",
+          ...(findingIds ? { findingIds } : {}),
         };
+        proj.arbitrations[p.contentionId as string] = ruling;
+        proj.arbitrationLog.push({ contentionId: p.contentionId as string, ...ruling });
         break;
+      }
       case "RatificationCast":
         proj.ratifications.push({
           phase: p.phase as RatificationCast["phase"],
@@ -297,6 +349,7 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
           seat: p.seat as string,
           vote: p.vote as RatificationCast["vote"],
           citedContentionId: p.citedContentionId as string | undefined,
+          ballot,
         });
         break;
       case "RatificationVoteMissing":
@@ -305,6 +358,7 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
           round: p.round as number,
           seat: p.seat as string,
           missingReason: p.reason as RatificationVoteMissing["reason"],
+          ballot,
         });
         break;
       case "ContentionResolved":
@@ -320,7 +374,10 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
         if (p.kind === "plan") proj.planVersion = Math.max(proj.planVersion, p.version as number);
         break;
       case "BudgetSpent":
-        if (typeof p.costUsd === "number") proj.spentUsd += p.costUsd;
+        if (typeof p.costUsd === "number") {
+          proj.spentUsd += p.costUsd;
+          if (typeof p.seat === "string") proj.spendBySeat[p.seat] = (proj.spendBySeat[p.seat] ?? 0) + p.costUsd;
+        }
         break;
       case "SessionErrored":
         proj.errored = true;
@@ -329,6 +386,9 @@ export function projectSession(sessionId: string, events: StoredEvent[]): Sessio
       case "SessionCancelled":
         proj.cancelled = true;
         proj.cancelReason = p.reason as string;
+        break;
+      case "ChangesApplied":
+        proj.applied = { target: p.target as string, files: p.files as ChangesApplied["files"], at: ev.ts };
         break;
       case "SessionConcluded":
         proj.outcome = p.outcome as SessionOutcome;
@@ -379,14 +439,14 @@ export function summarizeDeliberation(proj: SessionProjection): DeliberationSumm
     byTerminalState[contention.status] = (byTerminalState[contention.status] ?? 0) + 1;
   }
 
-  const rulings = Object.values(proj.arbitrations);
+  const rulings = proj.arbitrationLog;
   const countRuling = (name: string) => rulings.filter((ruling) => ruling.ruling === name).length;
 
   // Ballots are grouped by (phase, round) so a re-vote in a later round reads as its own tally
   // rather than being summed into the earlier one.
   const tallies = new Map<string, DeliberationSummary["ratifications"][number]>();
   for (const entry of proj.ratifications) {
-    const key = `${entry.phase}#${entry.round}`;
+    const key = `${entry.phase}#${entry.round}#${entry.ballot}`;
     const tally = tallies.get(key) ?? { phase: entry.phase, round: entry.round, approve: 0, approveWithChanges: 0, reject: 0, missing: 0 };
     if ("missingReason" in entry) tally.missing += 1;
     else if (entry.vote === "APPROVE") tally.approve += 1;
@@ -452,20 +512,29 @@ export function pendingHumanRulings(proj: SessionProjection): PendingHumanRuling
 }
 
 /**
- * Human rulings that settled a contention, keyed by contention id. Later rounds consult this so a
- * dispute a human already decided is never re-arbitrated (or re-escalated) by policy.
+ * A human's ruling on a set of claims. Later rounds consult these so a dispute a human already
+ * decided is never re-arbitrated (or re-escalated) by policy — but only when the same claims are
+ * raised again: a different problem in the same file is its own dispute.
  */
-export function humanRulings(proj: SessionProjection): Map<string, { ruling: string; reasoning: string; targets: string[] }> {
-  const rulings = new Map<string, { ruling: string; reasoning: string; targets: string[] }>();
-  for (const [contentionId, arbitration] of Object.entries(proj.arbitrations)) {
-    if (arbitration.source !== "human") continue;
-    rulings.set(contentionId, {
-      ruling: arbitration.ruling,
-      reasoning: arbitration.reasoning,
-      targets: proj.contentions[contentionId]?.targets ?? [],
-    });
+export interface HumanRuling {
+  contentionId: string;
+  ruling: string;
+  reasoning: string;
+  targets: string[];
+  findingIds: string[];
+}
+
+/** Every human ruling, latest per set of claims, in the order made. */
+export function humanRulings(proj: SessionProjection): HumanRuling[] {
+  const byClaims = new Map<string, HumanRuling>();
+  for (const entry of proj.arbitrationLog) {
+    if (entry.source !== "human") continue;
+    const findingIds = entry.findingIds ?? [];
+    const key = `${entry.contentionId}|${[...findingIds].sort().join(",")}`;
+    byClaims.delete(key);
+    byClaims.set(key, { contentionId: entry.contentionId, ruling: entry.ruling, reasoning: entry.reasoning, targets: proj.contentions[entry.contentionId]?.targets ?? [], findingIds });
   }
-  return rulings;
+  return [...byClaims.values()];
 }
 
 export type SessionState = "running" | "approved" | "not_approved" | "awaiting_human" | "cancelled" | "errored";

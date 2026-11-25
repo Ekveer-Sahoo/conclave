@@ -1,8 +1,10 @@
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { EventStore } from "../store/eventStore.js";
 import { projectSession, sessionState, type SessionState } from "../store/projections.js";
-import { pruneWorktree } from "../worktree/worktree.js";
-import { isSessionActive } from "./autonomousCouncil.js";
+import { pruneWorktree, snapshotRoot } from "../worktree/worktree.js";
+import { isSessionActive, withSessionLock } from "./autonomousCouncil.js";
 
 export interface PruneCandidate {
   sessionId: string;
@@ -59,12 +61,29 @@ export async function pruneSessions(options: { dbPath: string; olderThanMs: numb
         result.pruned.push({ ...candidate, branchDeleted: false });
         continue;
       }
-      const { branchDeleted } = await pruneWorktree({
-        path: proj.worktree.path,
-        branch: proj.worktree.branch,
-        baseCommit: proj.worktree.baseCommit,
-        sourceCwd: proj.repoPath,
+      const worktree = proj.worktree;
+      const repoPath = proj.repoPath;
+      // Held while pruning, so a resume that starts right now cannot run in a worktree being deleted.
+      const pruned = await withSessionLock(options.dbPath, sessionId, async () => {
+        const outcome = await pruneWorktree({
+          path: worktree.path,
+          branch: worktree.branch,
+          baseCommit: worktree.baseCommit,
+          sourceCwd: worktree.repository ?? repoPath,
+        });
+        // An unratified session's private snapshot has nothing left to apply: remove it too — but only
+        // ever inside Conclave's own snapshot directory.
+        const snapshotRepo = worktree.snapshot ? worktree.repository : undefined;
+        if (snapshotRepo && resolve(snapshotRepo).startsWith(resolve(snapshotRoot()) + sep)) {
+          await rm(snapshotRepo, { recursive: true, force: true });
+        }
+        return outcome;
       });
+      if (!pruned) {
+        result.skipped.push({ sessionId, reason: "a process is still running it" });
+        continue;
+      }
+      const { branchDeleted } = pruned;
       if (existsSync(proj.worktree.path)) {
         result.skipped.push({ sessionId, reason: `could not remove ${proj.worktree.path}` });
         continue;

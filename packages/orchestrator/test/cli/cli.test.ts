@@ -75,3 +75,79 @@ test("run → list → status → arbitrate → cancel → prune, with sessions 
   assert.equal((await run(["run", "x", "--budget", "-3"])).code, 2);
   assert.equal((await run(["bogus"])).code, 2);
 });
+
+test("conclave seats lists, switches, resets, and guards seats; run --model rejects unknown seats", async () => {
+  const { home, repo, run } = await sandbox();
+  const configPath = join(home, "seat-config.json");
+  await writeFile(configPath, JSON.stringify({ version: 1, seats: [
+    { id: "claude", label: "Claude", adapter: "fake", role: "ARCHITECTURE" },
+    { id: "helper", label: "Helper", adapter: "cli", cliCommand: "definitely-not-installed", role: "CORRECTNESS", enabled: false },
+  ] }));
+  const listed = await run(["seats"]);
+  assert.equal(listed.code, 0);
+  assert.match(listed.stdout, /claude\s+fake/);
+  assert.match(listed.stdout, /off\s+helper\s+cli\s+default model/);
+
+  const set = await run(["seats", "set", "helper", "some-model-2"]);
+  assert.equal(set.code, 0, set.stderr);
+  const saved = JSON.parse(await (await import("node:fs/promises")).readFile(configPath, "utf8")) as { seats: Array<{ id: string; cliModel?: string }> };
+  assert.equal(saved.seats.find((s) => s.id === "helper")?.cliModel, "some-model-2");
+  assert.match((await run(["seats"])).stdout, /helper\s+cli\s+some-model-2/);
+
+  assert.equal((await run(["seats", "reset", "helper"])).code, 0);
+  assert.match((await run(["seats"])).stdout, /helper\s+cli\s+default model/);
+
+  assert.equal((await run(["seats", "set", "claude", "x"])).code, 2, "a fake seat has no model to switch");
+  assert.equal((await run(["seats", "disable", "claude"])).code, 2, "claude cannot be disabled");
+  assert.equal((await run(["seats", "set", "nosuch", "x"])).code, 2);
+  assert.match((await run(["seats", "models", "claude"])).stdout, /ignore the model/);
+
+  const badRun = await run(["run", "task", "--model", "nosuch=x"]);
+  assert.equal(badRun.code, 2);
+  assert.match(badRun.stderr, /no seat named nosuch/);
+  assert.equal((await run(["run", "task", "--model", "claude"])).code, 2);
+  void repo;
+});
+
+test("options are parsed strictly: --help anywhere, --flag=value, unknown options refused, bad values refused", async () => {
+  const { home, repo, run } = await sandbox();
+  const help = await run(["run", "--help"]);
+  assert.equal(help.code, 0);
+  assert.match(help.stdout, /Usage: conclave run/);
+  assert.match((await run(["list"])).stdout, /No sessions/, "--help after a command runs nothing");
+
+  const inline = await run(["run", "add", "a", "readme", `--db=${join(home, "inline.db")}`, "--budget=3"]);
+  assert.equal(inline.code, 0, inline.stderr);
+  assert.match(inline.stdout, /Task: add a readme\n/, "inline values are options, not task text");
+  assert.match(inline.stdout, /of a \$3\.00 ceiling/);
+
+  const unknown = await run(["prune", "--older-than", "0", "--dryrun"]);
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.stderr, /Unknown option --dryrun/);
+
+  const missing = await run(["run", "task", "--budget"]);
+  assert.equal(missing.code, 2);
+  assert.match(missing.stderr, /--budget needs a value/);
+
+  const limit = await run(["list", "--limit", "2.5"]);
+  assert.equal(limit.code, 2);
+  assert.match(limit.stderr, /--limit must be a positive whole number/);
+
+  const unknownSession = await run(["status", "no-such-session"]);
+  assert.equal(unknownSession.code, 2);
+  assert.match(unknownSession.stderr, /no session found/);
+  assert.doesNotMatch(unknownSession.stderr, /\n\s+at /, "a plain message, not a stack trace");
+  void repo;
+});
+
+test("run refuses to start when the seat config is invalid, rather than convening the default (billed) seats", async () => {
+  const { home, run } = await sandbox();
+  await writeFile(join(home, "seat-config.json"), JSON.stringify({ version: 3, seats: [{ id: "claude", label: "c", adapter: "fake", role: "REVIEWER" }] }));
+  const result = await run(["run", "a", "task"]);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /is invalid/);
+  assert.match(result.stderr, /No council was started/);
+  const seats = await run(["seats", "disable", "codex"]);
+  assert.equal(seats.code, 2, "a seats change does not silently replace the invalid file");
+  assert.match(seats.stderr, /--replace-invalid/);
+});

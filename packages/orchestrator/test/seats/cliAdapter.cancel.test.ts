@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { SeatConfig } from "@conclave/core";
-import { CliCancelledError, invokeCliSeat } from "../../src/seats/cliAdapter.ts";
+import { CliCancelledError, invokeCliSeat } from "../../dist/seats/cliAdapter.js";
 
 function isAlive(pid: number): boolean {
   try {

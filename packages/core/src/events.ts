@@ -32,6 +32,22 @@ export const WorktreeCreatedEvent = base("WorktreeCreated", {
   baseCommit: z.string(),
   branch: z.string(),
   path: z.string(),
+  /**
+   * The git repository the worktree belongs to, when it is not the session's own folder: a folder
+   * that is not a git repository is run from a private snapshot repository of it, and this is that.
+   */
+  repository: z.string().optional(),
+  /** True when the session runs on a private snapshot of a plain folder rather than on a git repository. */
+  snapshot: z.boolean().optional(),
+});
+
+/**
+ * Ratified changes written into a plain (non-git) folder, on the operator's explicit request —
+ * the only time Conclave ever modifies the folder it was run against.
+ */
+export const ChangesAppliedEvent = base("ChangesApplied", {
+  target: z.string(),
+  files: z.array(z.object({ path: z.string(), change: z.enum(["added", "modified", "deleted"]) })),
 });
 
 export const WorktreeTreeHashRecordedEvent = base("WorktreeTreeHashRecorded", {
@@ -61,6 +77,10 @@ export const SeatInvokedEvent = base("SeatInvoked", {
   round: z.number().int().nonnegative(),
   verdict: VerdictSchema.optional(),
   status: z.enum(["OK", "UNAVAILABLE", "MALFORMED"]),
+  /** The model Conclave asked for (the seat's configured or per-run model); absent means the CLI's own default. */
+  requestedModel: z.string().optional(),
+  /** The model the provider reports actually answering, when it reports one. Can differ from the request: aliases, gateway routing. */
+  model: z.string().optional(),
 });
 
 export const FindingRecordedEvent = base("FindingRecorded", {
@@ -97,10 +117,14 @@ export const ThreadMessageAddedEvent = base("ThreadMessageAdded", {
 
 export const VerificationRunEvent = base("VerificationRun", {
   contentionId: z.string().optional(),
+  /** The seat that ran the test (absent on events written before this was recorded). */
+  seat: z.string().optional(),
   findingId: z.string(),
   command: z.string(),
   result: z.enum(["TRUE", "FALSE", "INCONCLUSIVE"]),
   output: z.string(),
+  /** The worktree's tree hash when the test ran: evidence only counts against that same code. */
+  treeHash: z.string().optional(),
 });
 
 /**
@@ -133,6 +157,8 @@ export const ArbitrationRuledEvent = base("ArbitrationRuled", {
   ruling: z.string(),
   reasoning: z.string(),
   source: z.enum(["policy", "human"]).default("policy"),
+  /** The claims ruled on. A contention id is only a hash of the file; a ruling covers these claims. */
+  findingIds: z.array(z.string()).optional(),
 });
 
 export const RatificationCastEvent = base("RatificationCast", {
@@ -263,6 +289,7 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   SessionConcludedEvent,
   SessionConfiguredEvent,
   SessionResumedEvent,
+  ChangesAppliedEvent,
 ]);
 
 export type EventEnvelope = z.infer<typeof EventEnvelopeSchema>;

@@ -3,7 +3,9 @@ import type { ContentionCandidate } from "./contention.js";
 
 /**
  * Weight a single claim carries, before confidence scaling. A BLOCKER asserted at full confidence
- * outweighs two silent approvals; a MINOR does not outweigh even one.
+ * exactly balances two silent approvals (1.0 against 2 × 0.5): too close to call, so on its own it
+ * is neither upheld nor dismissed but escalates to a human (see `arbitrate`). A MINOR does not
+ * outweigh even one approval.
  */
 const SEVERITY_WEIGHT: Record<Severity, number> = { BLOCKER: 1, MAJOR: 0.6, MINOR: 0.25, NIT: 0.1 };
 /** What one seat's silent approval of a target is worth against a claim on it. */
@@ -72,8 +74,12 @@ export function arbitrate(input: ArbitrateInput): ArbitrationDecision {
         .join(", ")}).`,
     );
   }
-  // Only a clean sweep disproves a claim: one inconclusive run leaves the question open.
-  if (disproved.length > 0 && disproved.length === relevant.length) {
+  // Only a clean sweep disproves a contention: every claim in it refuted by a test that ran. One
+  // inconclusive run leaves the question open — and so does a claim nobody tested: refuting a
+  // tested MAJOR says nothing about an untested BLOCKER on the same file.
+  const refutedIds = new Set(disproved.map((item) => item.findingId));
+  const inconclusive = relevant.some((item) => item.result === "INCONCLUSIVE" && !refutedIds.has(item.findingId));
+  if (disproved.length > 0 && !inconclusive && contention.findingIds.every((findingId) => refutedIds.has(findingId))) {
     return decide(
       "DISMISSED",
       "WITHDRAWN",

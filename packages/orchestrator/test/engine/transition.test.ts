@@ -83,8 +83,10 @@ test("a failed plan ratification revises the plan until the discussion cap stops
   assert.equal(capped.kind === "terminal" && capped.outcome, "NOT_APPROVED");
 });
 
-test("a failed work ratification refines until the remediation cap stops it", () => {
-  expectAdvance("RATIFY_WORK", "NOT_RATIFIED", "WORK_REFINE", 1, 1);
+test("a failed work ratification remediates in the next round, until the remediation cap stops it", () => {
+  // Not back to WORK_REFINE at the same round: with nothing to deliberate, that returned straight to
+  // the vote without consuming a round, and one steady REJECT looped until the step guard tripped.
+  expectAdvance("RATIFY_WORK", "NOT_RATIFIED", "REMEDIATE", 2, 1);
   const capped = step("RATIFY_WORK", "NOT_RATIFIED", 3, { remediationRoundCap: 3 });
   assert.equal(capped.kind, "terminal");
   assert.equal(capped.kind === "terminal" && capped.outcome, "NOT_APPROVED");
@@ -153,7 +155,7 @@ test("resume re-verifies rather than trusting an interrupted finalization", () =
 
 test("a plan ratified but never executed resumes into EXECUTE, not back into the audit", () => {
   assert.deepEqual(
-    resumeEntry({ phase: "RATIFY_PLAN", round: 1, phaseOpen: false, lastPhaseOutcome: "ratified" }),
+    resumeEntry({ phase: "RATIFY_PLAN", round: 1, phaseOpen: false, lastPhaseOutcome: "RATIFIED" }),
     { phase: "EXECUTE", round: 0 },
   );
   assert.deepEqual(
@@ -161,4 +163,11 @@ test("a plan ratified but never executed resumes into EXECUTE, not back into the
     { phase: "PLAN_AUDIT", round: 1 },
     "a vote that never closed must be re-taken",
   );
+});
+
+test("a vote that failed only on missing ballots is simply taken again, not sent to the executor", () => {
+  expectAdvance("RATIFY_WORK", "VOTE_INCOMPLETE", "RATIFY_WORK", 2, 1);
+  expectAdvance("RATIFY_PLAN", "VOTE_INCOMPLETE", "RATIFY_PLAN", 1, 0);
+  const capped = step("RATIFY_WORK", "VOTE_INCOMPLETE", 3, { remediationRoundCap: 3 });
+  assert.equal(capped.kind === "terminal" && capped.outcome, "NOT_APPROVED");
 });

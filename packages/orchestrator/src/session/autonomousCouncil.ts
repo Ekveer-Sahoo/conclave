@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { performance } from "node:perf_hooks";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_CLI_SEATS, type Finding, type Phase, type SeatConfig, type StoredEvent, type Verdict } from "@conclave/core";
-import { CliInvocationError, CliCancelledError, type CommandCapture, type ProviderUsage } from "../seats/cliAdapter.js";
+import { CliInvocationError, CliCancelledError, cliKind, type CommandCapture, type ProviderUsage } from "../seats/cliAdapter.js";
 import { invokeSeat, type SeatOutcome } from "../seats/index.js";
-import { detectContentions, uncontestedDefects, type ContentionCandidate } from "../engine/contention.js";
+import { detectContentions, OVERALL_TARGET, uncontestedDefects, type ContentionCandidate } from "../engine/contention.js";
 import { arbitrate, blocksAdvancement, type ArbitrationDecision, type VerificationEvidence } from "../engine/arbitration.js";
 import { tallyRatification } from "../engine/ratification.js";
 import { resumeEntry, transition, type PhaseSignal, type TransitionDecision } from "../engine/transition.js";
@@ -18,9 +20,16 @@ import {
   type SessionProjection,
 } from "../store/projections.js";
 import {
+  ApplyConflictError,
+  applySnapshotChanges,
   assertCleanRepository,
   assertResumableWorktree,
   assertValidRepository,
+  createSnapshotRepository,
+  escapingSymlinks,
+  inspectRepository,
+  UnsafeSymlinkError,
+  type AppliedChange,
   commitAndRemoveWorktree,
   computeDiff,
   computeTreeHash,
@@ -39,8 +48,8 @@ const PRICING_PER_1K_TOKENS: Record<string, { prompt: number; completion: number
   codex: { prompt: 0.002, completion: 0.008 },
   antigravity: { prompt: 0.00125, completion: 0.005 },
 };
-function estimateCostUsd(seatId: string, promptTokens: number, completionTokens: number): number {
-  const rate = PRICING_PER_1K_TOKENS[seatId] ?? { prompt: 0.002, completion: 0.008 };
+function estimateCostUsd(seat: SeatConfig, promptTokens: number, completionTokens: number): number {
+  const rate = PRICING_PER_1K_TOKENS[cliKind(seat)] ?? { prompt: 0.002, completion: 0.008 };
   return (promptTokens / 1000) * rate.prompt + (completionTokens / 1000) * rate.completion;
 }
 export interface CouncilActivity { at: string; kind: "phase" | "seat" | "system" | "report"; message: string; seat?: string; phase?: Phase; round?: number; verdict?: Verdict }
@@ -77,6 +86,72 @@ function framed(prompt: string): string {
   ].join("\n");
 }
 
+/**
+ * A verdict attributed to the seat that actually returned it. Models write whatever they like into
+ * `seat` and `finding.id` ("verifier", "F1"): trusting that would credit findings to seats that do
+ * not exist, let two seats' "F1" overwrite each other, and — because contention detection reads
+ * `finding.seat` to decide who objected — misattribute a dispute's claimants.
+ */
+/** The model a seat is configured (or overridden for this run) to use; undefined = the CLI's own default. */
+export const requestedModelOf = (seat: SeatConfig): string | undefined =>
+  seat.adapter === "xenia" ? seat.xeniaModel : seat.adapter === "cli" ? seat.cliModel : undefined;
+
+function attributeVerdict(seatId: string, verdict: Verdict): Verdict {
+  return {
+    ...verdict,
+    seat: seatId,
+    findings: verdict.findings.map((finding) => ({
+      ...finding,
+      seat: seatId,
+      id: finding.id.startsWith(`${seatId}:`) ? finding.id : `${seatId}:${finding.id}`,
+    })),
+  };
+}
+
+/** What a finding claims — two findings with the same id and the same claim are one finding. */
+const claimOf = (finding: Finding) => `${finding.target}\u0000${finding.description}\u0000${finding.falsifiable_test ?? ""}`;
+
+/**
+ * Gives every distinct claim its own id. Models number findings "F1", "F2" afresh in every answer,
+ * so a seat's F1 in the work audit is usually not its F1 from the plan audit — and evidence,
+ * arbitration and human rulings are all keyed by id. The same claim raised again keeps its id (and
+ * its evidence); a different claim reusing an id gets a suffix ("codex:F1~2").
+ */
+function distinctFindings(verdict: Verdict, known: Map<string, Finding>): Verdict {
+  const taken = new Map(known);
+  const findings = verdict.findings.map((finding) => {
+    let id = finding.id;
+    for (let n = 2; taken.has(id) && claimOf(taken.get(id)!) !== claimOf(finding); n++) id = `${finding.id}~${n}`;
+    const distinct = id === finding.id ? finding : { ...finding, id };
+    taken.set(id, distinct);
+    return distinct;
+  });
+  return { ...verdict, findings };
+}
+
+/**
+ * A seat that rejects without filing a finding still objects to something. Its objection becomes a
+ * real finding — recorded, weighed in arbitration like any other, and shown to the executor with the
+ * seat's own reasoning — rather than an anonymous "objects to __overall__".
+ */
+function withOverallFinding(verdict: Verdict): Verdict {
+  if (verdict.overall_verdict !== "REJECT" || verdict.findings.length > 0) return verdict;
+  return {
+    ...verdict,
+    findings: [{
+      id: `${verdict.seat}:${OVERALL_TARGET}`,
+      seat: verdict.seat,
+      role: "SPEC_FIDELITY",
+      target: OVERALL_TARGET,
+      category: "unstructured-rejection",
+      severity: "BLOCKER",
+      description: verdict.verdict_reasoning,
+      falsifiable_test: null,
+      confidence: 0.5,
+    }],
+  };
+}
+
 const transcript = (round: CouncilRound) => round.verdicts.map((v) => `${v.seat}: ${v.overall_verdict}\n${v.verdict_reasoning}\nFindings: ${v.findings.map((f) => `[${f.severity}] ${f.description}`).join("; ") || "none"}`).join("\n\n");
 
 /**
@@ -96,7 +171,13 @@ function buildReport(input: {
   const lines = ["# Conclave report", "", `Task: ${task}`, `Outcome: ${OUTCOME_HEADLINE[outcome]}`];
   if (reason) lines.push(`Reason: ${reason}`);
   lines.push(`Session: ${sessionId}`);
-  if (proj?.worktree) {
+  if (proj?.worktree?.snapshot) {
+    lines.push(
+      outcome === "APPROVED"
+        ? `Changes: ratified in a private snapshot of the folder; the folder itself has not been modified. Apply them with: conclave apply ${sessionId} (or "Apply to folder" in the web UI).`
+        : `Worktree: kept at ${proj.worktree.path} (a private snapshot of the folder) for inspection.`,
+    );
+  } else if (proj?.worktree) {
     lines.push(
       outcome === "APPROVED"
         ? `Branch: ${proj.worktree.branch} holds the ratified work as a single commit on top of ${proj.worktree.baseCommit.slice(0, 12)}. Review and merge it yourself; Conclave never merges or pushes.`
@@ -105,7 +186,7 @@ function buildReport(input: {
   }
   if (proj) {
     const ceiling = proj.budgetCeilingUsd !== undefined ? ` of a $${proj.budgetCeilingUsd.toFixed(2)} ceiling` : "";
-    lines.push(`Spend: $${proj.spentUsd.toFixed(4)}${ceiling}`);
+    lines.push(`Spend: $${proj.spentUsd.toFixed(2)}${ceiling}`);
   }
   lines.push(`Council rounds in this run: ${rounds.length}`);
 
@@ -149,6 +230,19 @@ function buildReport(input: {
     }
   }
 
+  if (proj?.seats?.length) {
+    // Which model each seat actually used — the configured one, and what the provider reported
+    // answering when that differs (an alias, or a gateway's auto-routing).
+    const invocations = Object.values(proj.seatInvocations);
+    lines.push("", "## Seats");
+    for (const seat of proj.seats) {
+      const configured = seat.adapter === "xenia" ? seat.xeniaModel : seat.adapter === "cli" ? seat.cliModel : undefined;
+      const answered = [...new Set(invocations.filter((i) => i.seat === seat.id && i.model).map((i) => i.model!))];
+      const reported = answered.filter((model) => model !== configured);
+      lines.push(`- ${seat.label} (${seat.id}): ${seat.adapter === "fake" ? "fake seat" : configured ?? "CLI default model"}${reported.length ? `; answered by ${reported.join(", ")}` : ""}`);
+    }
+  }
+
   const final = rounds.at(-1);
   lines.push("", "## Final council", ...(final?.verdicts.map((v) => `- ${v.seat}: ${v.overall_verdict} — ${v.verdict_reasoning}`) ?? ["- No verdicts"]));
   return lines.join("\n");
@@ -174,41 +268,89 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 const lockDirFor = (dbPath: string) => join(dirname(dbPath), ".locks");
+
+/**
+ * The holder touches its lock every few seconds. A pid alone cannot prove a lock is live: after a
+ * crash the pid can be reused by an unrelated process (routinely, in a container that restarts with
+ * the same pid), which would strand the session forever. A lock is live while its pid is alive AND
+ * it was touched recently.
+ */
+const LOCK_HEARTBEAT_MS = 5_000;
+const LOCK_STALE_MS = 120_000;
+/** A lock file whose pid is not written yet is a claim in progress, not a stale lock. */
+const LOCK_CLAIM_GRACE_MS = 5_000;
+const lockHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
+
+function lockIsLive(lockPath: string): { live: boolean; pid?: number } {
+  let pid: number | undefined;
+  let ageMs: number;
+  try {
+    ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    const parsed = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    pid = Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return { live: false }; // no lock file
+  }
+  if (pid === undefined) return { live: ageMs < LOCK_CLAIM_GRACE_MS };
+  return { live: ageMs < LOCK_STALE_MS && isProcessAlive(pid), pid };
+}
+
 function acquireSessionLock(dbPath: string, sessionId: string): string {
   const lockDir = lockDirFor(dbPath);
   mkdirSync(lockDir, { recursive: true });
   const lockPath = join(lockDir, `${sessionId}.lock`);
   const claim = () => writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+  const held = () => new Error(`session ${sessionId} already has a run or resume in progress (lock held at ${lockPath})`);
+  let claimed = false;
   try {
     claim();
-    return lockPath;
+    claimed = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
-  let heldPid: number | undefined;
-  try {
-    heldPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-  } catch {
-    heldPid = undefined; // lock file vanished between our failed claim and this read; fall through to retry
-  }
-  if (heldPid !== undefined && Number.isFinite(heldPid) && isProcessAlive(heldPid)) {
-    throw new Error(`session ${sessionId} already has a run or resume in progress (pid ${heldPid}, lock held at ${lockPath})`);
-  }
-  // The recorded owner is gone (or the lock content was unreadable/corrupt): reclaim the stale lock.
-  // rm+claim is not perfectly atomic against another concurrent reclaimer, so if we lose that race
-  // the second claim() throws EEXIST again and we surface it as genuine contention rather than looping.
-  rmSync(lockPath, { force: true });
-  try {
-    claim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`session ${sessionId} already has a run or resume in progress (lock held at ${lockPath})`);
+  if (!claimed) {
+    const state = lockIsLive(lockPath);
+    if (state.live) throw held();
+    // The recorded owner is gone (or its lock went stale): reclaim it. rm+claim is not perfectly
+    // atomic against another concurrent reclaimer, so losing that race surfaces as contention.
+    rmSync(lockPath, { force: true });
+    try {
+      claim();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw held();
+      throw error;
     }
-    throw error;
   }
+  const heartbeat = setInterval(() => {
+    try {
+      const now = new Date();
+      utimesSync(lockPath, now, now);
+    } catch {
+      // Lock gone (released or reclaimed): nothing to keep alive.
+    }
+  }, LOCK_HEARTBEAT_MS);
+  heartbeat.unref();
+  lockHeartbeats.set(lockPath, heartbeat);
   return lockPath;
 }
+/** Runs `work` holding the session's lock — or returns undefined, doing nothing, if another process holds it. */
+export async function withSessionLock<T>(dbPath: string, sessionId: string, work: () => Promise<T>): Promise<T | undefined> {
+  let lockPath: string;
+  try {
+    lockPath = acquireSessionLock(dbPath, sessionId);
+  } catch {
+    return undefined;
+  }
+  try {
+    return await work();
+  } finally {
+    releaseSessionLock(lockPath);
+  }
+}
+
 function releaseSessionLock(lockPath: string): void {
+  clearInterval(lockHeartbeats.get(lockPath));
+  lockHeartbeats.delete(lockPath);
   try {
     const held = readFileSync(lockPath, "utf8").trim();
     if (held !== String(process.pid)) return; // not ours (e.g. reclaimed by another process); leave it alone
@@ -225,14 +367,7 @@ function releaseSessionLock(lockPath: string): void {
  * callers (the HTTP API) combine this with the projection to report that distinction to clients.
  */
 export function isSessionActive(dbPath: string, sessionId: string): boolean {
-  const lockPath = join(lockDirFor(dbPath), `${sessionId}.lock`);
-  let heldPid: number;
-  try {
-    heldPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-  } catch {
-    return false; // no lock file — nothing is currently running this session
-  }
-  return Number.isFinite(heldPid) && isProcessAlive(heldPid);
+  return lockIsLive(join(lockDirFor(dbPath), `${sessionId}.lock`)).live;
 }
 
 /**
@@ -253,6 +388,9 @@ export function requestCancel(dbPath: string, sessionId: string): void {
 
 /** How often a running session checks for an out-of-process cancellation request. */
 const CANCEL_POLL_MS = 500;
+
+/** Milliseconds since `started` (from performance.now): monotonic, so a clock step can't make it negative. */
+const elapsedMs = (started: number) => Math.max(0, Math.round(performance.now() - started));
 
 /** One step in the phase graph: which phase to run, at which round. */
 type SessionEntry = { phase: Phase; round: number };
@@ -283,7 +421,7 @@ const clipText = (text: string, max: number) => (text.length > max ? `${text.sli
  * produces evidence rather than an unverifiable claim. Ordered by preference.
  */
 const VERIFIER_PREFERENCE = ["claude", "codex"];
-const canVerify = (seat: SeatConfig) => seat.adapter === "fake" || (seat.adapter === "cli" && VERIFIER_PREFERENCE.includes(seat.id));
+const canVerify = (seat: SeatConfig) => seat.adapter === "fake" || (seat.adapter === "cli" && VERIFIER_PREFERENCE.includes(cliKind(seat)));
 
 const COMMAND_EXECUTED: ReadonlySet<CommandCapture["result"]> = new Set(["PASS", "FAIL"]);
 
@@ -316,6 +454,8 @@ async function runSessionCore(ctx: {
   entry: SessionEntry;
   /** The session as the log describes it before this run; set only on resume. */
   prior?: SessionProjection;
+  /** Contentions a human upheld while the session waited: the work this resumed leg starts on. */
+  upheld?: { contentions: ContentionCandidate[]; decisions: ArbitrationDecision[] };
 }): Promise<CouncilRunResult> {
   const { sessionId, dbPath, store, task, seats, claude, activeSeatIds, minQuorum, discussionCap, remediationCap, budgetCeilingUsd, worktree, emit, prior } = ctx;
   const worktreePath = worktree.path;
@@ -324,9 +464,9 @@ async function runSessionCore(ctx: {
   const artifactsDir = `${worktree.path}-artifacts`;
 
   // Out-of-process cancellation (`conclave cancel`) aborts this run the same way the caller's own
-  // signal would. A request file left over from an earlier, already-finished run is stale.
+  // signal would. (A stale request file was cleared when the lock was taken, so a request made
+  // during setup — while the worktree or snapshot was being created — is honored, not discarded.)
   const cancelFile = cancelRequestPath(dbPath, sessionId);
-  rmSync(cancelFile, { force: true });
   const internalAbort = new AbortController();
   const signal = ctx.signal ? AbortSignal.any([ctx.signal, internalAbort.signal]) : internalAbort.signal;
   const cancelWatch = setInterval(() => {
@@ -341,11 +481,32 @@ async function runSessionCore(ctx: {
   /** Every finding seen in this session, so arbitration can look up severity/confidence by id. */
   const findingsById = new Map<string, Finding>(Object.values(prior?.findings ?? {}).map((finding) => [finding.id, finding]));
   /** Falsifiable tests actually executed against a finding — arbitration's hard evidence. */
-  const evidence: VerificationEvidence[] = (prior?.verifications ?? []).map((run) => ({ findingId: run.findingId, result: run.result }));
+  /**
+   * Each result is tied to the tree it ran against: a test run before EXECUTE or a remediation says
+   * nothing about the code after it (a route that did not exist yet cannot reproduce a bug in it).
+   */
+  const evidence: Array<VerificationEvidence & { treeHash?: string }> = [];
+  /**
+   * A conclusive result supersedes earlier inconclusive attempts at the same finding on the same
+   * tree: a flaky first run must not outvote the reproduction or refutation that followed it.
+   */
+  const addEvidence = (item: VerificationEvidence & { treeHash?: string }) => {
+    if (item.result !== "INCONCLUSIVE") {
+      for (let index = evidence.length - 1; index >= 0; index--) {
+        const earlier = evidence[index]!;
+        if (earlier.findingId === item.findingId && earlier.treeHash === item.treeHash && earlier.result === "INCONCLUSIVE") evidence.splice(index, 1);
+      }
+    }
+    evidence.push(item);
+  };
+  for (const run of prior?.verifications ?? []) addEvidence({ findingId: run.findingId, result: run.result, treeHash: run.treeHash });
+  /** The evidence that speaks to the tree as it is now. */
+  const currentEvidence = (treeHash: string): VerificationEvidence[] =>
+    evidence.filter((item) => item.treeHash === treeHash).map(({ findingId, result }) => ({ findingId, result }));
   /** Contentions that are open right now; emptied once arbitration and any follow-up work close them. */
-  let openContentions: ContentionCandidate[] = [];
+  let openContentions: ContentionCandidate[] = ctx.upheld?.contentions ?? [];
   /** Arbitration outcomes that still require action (upheld or escalated, never dismissed). */
-  let actionable: ArbitrationDecision[] = [];
+  let actionable: ArbitrationDecision[] = ctx.upheld?.decisions ?? [];
   /** Material defects every active seat agreed on — these skip deliberation entirely. */
   let pendingDefects: Finding[] = [];
   let planText = prior?.planText ?? "";
@@ -364,12 +525,23 @@ async function runSessionCore(ctx: {
     }
   };
 
-  const recordSpend = (correlationId: string, seatId: string, phase: Phase, round: number, usage: ProviderUsage | null, latencyMs: number) => {
+  /**
+   * Records what a seat call cost. Never throws: every settled call is recorded before the ceiling is
+   * checked (checkBudget), so a stop never leaves a call that was made — and billed — out of the log.
+   * A successful call whose provider reported no usage is charged a conservative estimate (its prompt,
+   * plus its whole output allowance): unknown spend is not free spend, and must still hit the ceiling.
+   */
+  const recordSpend = (correlationId: string, seat: SeatConfig, phase: Phase, round: number, usage: ProviderUsage | null, latencyMs: number, promptChars?: number) => {
     if (!usage) {
-      store.append(sessionId, { type: "BudgetSpent", payload: { correlationId, seat: seatId, phase, round, usageAvailable: false, costSource: "unavailable", latencyMs } });
+      const estimate = promptChars !== undefined && seat.adapter !== "fake" ? estimateCostUsd(seat, Math.ceil(promptChars / 4), seat.maxTokens) : undefined;
+      if (estimate !== undefined) spentUsd += estimate;
+      store.append(sessionId, {
+        type: "BudgetSpent",
+        payload: { correlationId, seat: seat.id, phase, round, usageAvailable: false, ...(estimate !== undefined ? { costUsd: estimate, costSource: "local_estimate" as const } : { costSource: "unavailable" as const }), latencyMs },
+      });
       return;
     }
-    const costUsd = usage.costUsd ?? estimateCostUsd(seatId, usage.promptTokens, usage.completionTokens);
+    const costUsd = usage.costUsd ?? estimateCostUsd(seat, usage.promptTokens, usage.completionTokens);
     const costSource = usage.source === "xenia_envelope" && usage.costUsd !== undefined
       ? "xenia_authoritative"
       : usage.costUsd !== undefined
@@ -378,10 +550,19 @@ async function runSessionCore(ctx: {
     spentUsd += costUsd;
     store.append(sessionId, {
       type: "BudgetSpent",
-      payload: { correlationId, seat: seatId, phase, round, usageAvailable: true, promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, cachedInputTokens: usage.cachedInputTokens, costUsd, costSource, latencyMs },
+      payload: { correlationId, seat: seat.id, phase, round, usageAvailable: true, promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, cachedInputTokens: usage.cachedInputTokens, costUsd, costSource, latencyMs },
     });
+  };
+  /** Stops the run once recorded spend has gone past the ceiling. */
+  const checkBudget = () => {
     if (spentUsd > budgetCeilingUsd) {
       throw new BudgetExceededError(`budget ceiling exceeded: spent $${spentUsd.toFixed(4)} of $${budgetCeilingUsd.toFixed(2)}`);
+    }
+  };
+  /** Refuses to start another seat call once the ceiling is reached. */
+  const assertBudgetRemaining = () => {
+    if (spentUsd >= budgetCeilingUsd) {
+      throw new BudgetExceededError(`budget ceiling reached: spent $${spentUsd.toFixed(4)} of $${budgetCeilingUsd.toFixed(2)}`);
     }
   };
 
@@ -412,49 +593,71 @@ async function runSessionCore(ctx: {
   /** Disputes a human has already settled, restated so seats neither re-raise nor ignore them. */
   const humanSettledNote = (): string => {
     const rulings = humanRulings(currentProjection());
-    if (rulings.size === 0) return "";
-    const items = [...rulings.values()].map((ruling) => `- [${ruling.ruling}] ${ruling.targets.join(", ") || "(overall)"}: ${ruling.reasoning}`);
-    return `\n\nDisputes already settled by a human arbiter. Treat them as decided: do not re-raise a DISMISSED one, and an UPHELD one must actually be resolved.\n${items.join("\n")}`;
+    if (rulings.length === 0) return "";
+    const items = rulings.map((ruling) => {
+      const claims = ruling.findingIds.map((id) => findingsById.get(id)?.description).filter(Boolean).map((text) => `"${clipText(text!, 200)}"`);
+      return `- [${ruling.ruling}] ${ruling.targets.join(", ") || "(overall)"}${claims.length ? ` — the claim ${claims.join("; ")}` : ""}: ${ruling.reasoning}`;
+    });
+    return `\n\nDisputes already settled by a human arbiter. Treat those claims as decided: do not re-raise a DISMISSED claim, and an UPHELD one must actually be resolved. A different problem in the same file is not settled by them.\n${items.join("\n")}`;
   };
 
   /** Fans a prompt out to every active seat and records everything each one produced. */
   const fanOut = async (phase: Phase, round: number, prompt: string): Promise<CouncilRound> => {
+    // Checked before anything is spent: a council that has already lost its quorum, or its budget,
+    // must not pay for one more round only to discover that afterwards.
+    requireQuorum();
+    assertBudgetRemaining();
     const activeSeats = seats.filter((seat) => activeSeatIds.has(seat.id));
     const repoContext = await repoContextFor(phase, activeSeats);
-    const settled = await Promise.allSettled(
+    const fullPrompt = framed(prompt);
+    const settled = await Promise.all(
       activeSeats.map(async (seat) => {
-        const started = Date.now();
-        const outcome = await invokeSeat({ seat, prompt: framed(prompt), cwd: worktreePath, signal, repoContext });
-        return { ...outcome, latencyMs: Date.now() - started };
+        const started = performance.now();
+        try {
+          const outcome = await invokeSeat({ seat, prompt: fullPrompt, cwd: worktreePath, signal, repoContext });
+          return { ok: true as const, outcome, latencyMs: elapsedMs(started) };
+        } catch (error) {
+          return { ok: false as const, error, latencyMs: elapsedMs(started) };
+        }
       }),
     );
     if (signal.aborted) {
       // Interrupted mid-flight, not genuinely concluded: leave the phase open (no PhaseExited) so
-      // a resume restarts this exact round rather than burning it.
+      // a resume restarts this exact round rather than burning it. What the calls already cost is
+      // still recorded — the providers billed it whether or not the round counts.
+      settled.forEach((call, index) => {
+        const usage = call.ok ? call.outcome.usage : call.error instanceof CliInvocationError ? call.error.usage : null;
+        if (usage) recordSpend(randomUUID(), activeSeats[index]!, phase, round, usage, call.latencyMs);
+      });
       throw new CliCancelledError("session", `${phase} round ${round} cancelled`, []);
     }
     const result: CouncilRound = { phase, round, verdicts: [], failures: [] };
     for (let index = 0; index < settled.length; index++) {
-      const seat = activeSeats[index];
+      const seat = activeSeats[index]!;
       const correlationId = randomUUID();
-      const invocation = settled[index];
-      if (invocation.status === "fulfilled") {
-        const { verdict, usage, commandRuns, latencyMs } = invocation.value;
+      const call = settled[index]!;
+      if (call.ok) {
+        const { usage, commandRuns, model } = call.outcome;
+        const verdict = distinctFindings(withOverallFinding(attributeVerdict(seat.id, call.outcome.verdict)), findingsById);
         result.verdicts.push(verdict);
         emit({ kind: "seat", seat: seat.id, phase, round, verdict, message: verdict.verdict_reasoning });
-        store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: seat.id, phase, round, verdict, status: "OK" } });
+        store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: seat.id, phase, round, verdict, status: "OK", requestedModel: requestedModelOf(seat), model } });
         for (const finding of verdict.findings) {
           findingsById.set(finding.id, finding);
           store.append(sessionId, { type: "FindingRecorded", payload: { finding, phase, round } });
         }
         recordCommandRuns(seat.id, phase, round, commandRuns);
-        recordSpend(correlationId, seat.id, phase, round, usage, latencyMs);
+        recordSpend(correlationId, seat, phase, round, usage, call.latencyMs, fullPrompt.length + (repoContext?.length ?? 0));
       } else {
-        const error = String(invocation.reason);
+        const error = String(call.error);
         result.failures.push({ seat: seat.id, error });
         emit({ kind: "seat", seat: seat.id, phase, round, message: error });
-        store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: seat.id, phase, round, status: error.includes("invalid verdict") ? "MALFORMED" : "UNAVAILABLE" } });
-        if (invocation.reason instanceof CliInvocationError) recordCommandRuns(seat.id, phase, round, invocation.reason.commandRuns);
+        store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: seat.id, phase, round, status: error.includes("invalid verdict") ? "MALFORMED" : "UNAVAILABLE", requestedModel: requestedModelOf(seat) } });
+        if (call.error instanceof CliInvocationError) {
+          recordCommandRuns(seat.id, phase, round, call.error.commandRuns);
+          // A failed call can still have been billed (a timeout, an unusable answer).
+          if (call.error.usage) recordSpend(correlationId, seat, phase, round, call.error.usage, call.latencyMs);
+        }
       }
     }
     // A seat that could not answer drops out of the council for the rest of the run rather than
@@ -462,18 +665,29 @@ async function runSessionCore(ctx: {
     for (const failure of result.failures) activeSeatIds.delete(failure.seat);
     rounds.push(result);
     lastAuditTranscript = transcript(result);
+    checkBudget();
     return result;
   };
 
   /** Runs the one seat that is allowed to modify the repository. */
   const invokeExecutor = async (phase: Phase, round: number, prompt: string): Promise<Verdict> => {
+    assertBudgetRemaining();
     const correlationId = randomUUID();
-    const started = Date.now();
-    const { verdict, usage, commandRuns } = await invokeSeat({ seat: claude, cwd: worktreePath, mode: "execute", prompt: framed(prompt), signal });
+    const started = performance.now();
+    const fullPrompt = framed(prompt);
+    let outcome: SeatOutcome;
+    try {
+      outcome = await invokeSeat({ seat: claude, cwd: worktreePath, mode: "execute", prompt: fullPrompt, signal });
+    } catch (error) {
+      if (error instanceof CliInvocationError && error.usage) recordSpend(correlationId, claude, phase, round, error.usage, elapsedMs(started));
+      throw error;
+    }
+    const { verdict, usage, commandRuns, model } = outcome;
     emit({ kind: "seat", seat: claude.id, phase, round, verdict, message: verdict.verdict_reasoning });
-    store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: claude.id, phase, round, verdict, status: "OK" } });
+    store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: claude.id, phase, round, verdict, status: "OK", requestedModel: requestedModelOf(claude), model } });
     recordCommandRuns(claude.id, phase, round, commandRuns);
-    recordSpend(correlationId, claude.id, phase, round, usage, Date.now() - started);
+    recordSpend(correlationId, claude, phase, round, usage, elapsedMs(started), fullPrompt.length);
+    checkBudget();
     return verdict;
   };
 
@@ -507,11 +721,18 @@ async function runSessionCore(ctx: {
     // A contention left DEFERRED or escalated in an earlier round that this audit no longer raises
     // was dealt with by the refine/remediate work in between. Close it as superseded, so it neither
     // lingers as "open" in the log nor holds the session hostage waiting on a human.
+    // Only when every seat that raised it answered this audit: a claimant that timed out has not
+    // withdrawn anything, and its silence must never close an escalation no human has seen.
+    // (An upheld contention a later audit no longer raises was fixed, and is superseded too.)
     const detected = new Set(contentions.map((contention) => contention.contentionId));
-    for (const [contentionId, contention] of Object.entries(currentProjection().contentions)) {
-      if ((contention.status === "DEFERRED" || contention.status === "HUMAN_ARBITRATION") && !detected.has(contentionId)) {
-        store.append(sessionId, { type: "ContentionResolved", payload: { contentionId, terminalState: "SUPERSEDED" } });
-      }
+    const answered = new Set(result.verdicts.map((verdict) => verdict.seat));
+    const projection = currentProjection();
+    const LINGERING = new Set(["DEFERRED", "HUMAN_ARBITRATION", "ARBITRATED", "ACCEPTED"]);
+    for (const [contentionId, contention] of Object.entries(projection.contentions)) {
+      if (!LINGERING.has(contention.status) || detected.has(contentionId)) continue;
+      const claimants = contention.findingIds.map((id) => projection.findings[id]?.seat ?? id.split(":")[0]!);
+      if (claimants.length === 0 || !claimants.every((seat) => answered.has(seat))) continue;
+      store.append(sessionId, { type: "ContentionResolved", payload: { contentionId, terminalState: "SUPERSEDED" } });
     }
 
     if (contentions.length > 0) {
@@ -543,14 +764,14 @@ async function runSessionCore(ctx: {
    * dispute that can actually execute commands; its verdict says whether the claim reproduced, and
    * only counts as evidence if it demonstrably ran something. Returns how many verifications ran.
    */
-  const verifyClaims = async (contention: ContentionCandidate, phase: Phase, round: number, allowance: number): Promise<number> => {
+  const verifyClaims = async (contention: ContentionCandidate, phase: Phase, round: number, allowance: number, treeHash: string): Promise<number> => {
     let ran = 0;
     for (const findingId of contention.findingIds) {
       if (ran >= allowance) break;
       const finding = findingsById.get(findingId);
       if (!finding?.falsifiable_test) continue;
-      // Settled evidence is not re-litigated; an inconclusive run may be retried in a later round.
-      if (evidence.some((item) => item.findingId === findingId && item.result !== "INCONCLUSIVE")) continue;
+      // Settled evidence about this same code is not re-litigated; an inconclusive run may be retried.
+      if (evidence.some((item) => item.findingId === findingId && item.treeHash === treeHash && item.result !== "INCONCLUSIVE")) continue;
       const verifier = seats
         .filter((seat) => activeSeatIds.has(seat.id) && canVerify(seat) && !contention.claimants.includes(seat.id))
         .sort((a, b) => rank(a) - rank(b))[0];
@@ -558,6 +779,7 @@ async function runSessionCore(ctx: {
         emit({ kind: "system", phase, round, message: `No disinterested seat able to execute commands is available to run the falsifiable test for ${findingId}; arbitrating on policy alone.` });
         return ran;
       }
+      assertBudgetRemaining();
       ran += 1;
       const prompt = [
         `Task under review: ${task}`,
@@ -572,23 +794,26 @@ async function runSessionCore(ctx: {
         "- overall_verdict APPROVE_WITH_CHANGES if you could not run it or the result is ambiguous.",
       ].join("\n");
       const correlationId = randomUUID();
-      const started = Date.now();
+      const started = performance.now();
       let outcome: SeatOutcome;
+      const fullPrompt = framed(prompt);
       try {
-        outcome = await invokeSeat({ seat: verifier, prompt: framed(prompt), cwd: worktreePath, mode: "audit", findingId, signal });
+        outcome = await invokeSeat({ seat: verifier, prompt: fullPrompt, cwd: worktreePath, mode: "audit", findingId, signal });
       } catch (error) {
+        if (error instanceof CliInvocationError && error.usage) recordSpend(correlationId, verifier, phase, round, error.usage, elapsedMs(started));
         if (signal.aborted || error instanceof CliCancelledError) throw error;
         // A failed verification is missing evidence, not a failed council seat: record it as
         // inconclusive and fall back to policy, without evicting the verifier from the council.
         if (error instanceof CliInvocationError) recordCommandRuns(verifier.id, phase, round, error.commandRuns);
-        store.append(sessionId, { type: "VerificationRun", payload: { contentionId: contention.contentionId, findingId, command: finding.falsifiable_test, result: "INCONCLUSIVE", output: clipText(String(error), 2000) } });
-        evidence.push({ findingId, result: "INCONCLUSIVE" });
+        store.append(sessionId, { type: "VerificationRun", payload: { contentionId: contention.contentionId, seat: verifier.id, findingId, command: finding.falsifiable_test, result: "INCONCLUSIVE", output: clipText(String(error), 2000), treeHash } });
+        addEvidence({ findingId, result: "INCONCLUSIVE", treeHash });
         emit({ kind: "system", phase, round, message: `Verification of ${findingId} by ${verifier.id} failed: ${String(error)}` });
+        checkBudget();
         continue;
       }
-      const { verdict, usage, commandRuns } = outcome;
+      const { verdict, usage, commandRuns, model } = outcome;
       emit({ kind: "seat", seat: verifier.id, phase, round, verdict, message: `Verifying ${findingId}: ${verdict.verdict_reasoning}` });
-      store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: verifier.id, phase, round, verdict, status: "OK" } });
+      store.append(sessionId, { type: "SeatInvoked", payload: { correlationId, seat: verifier.id, phase, round, verdict, status: "OK", requestedModel: requestedModelOf(verifier), model } });
       recordCommandRuns(verifier.id, phase, round, commandRuns.map((run) => ({ ...run, findingId })));
       const executed = commandRuns.filter((run) => COMMAND_EXECUTED.has(run.result));
       const result: VerificationEvidence["result"] =
@@ -598,16 +823,17 @@ async function runSessionCore(ctx: {
               : "INCONCLUSIVE";
       store.append(sessionId, {
         type: "VerificationRun",
-        payload: { contentionId: contention.contentionId, findingId, command: executed.map((run) => run.command).join(" && ") || finding.falsifiable_test, result, output: clipText(verdict.verdict_reasoning, 2000) },
+        payload: { contentionId: contention.contentionId, seat: verifier.id, findingId, command: executed.map((run) => run.command).join(" && ") || finding.falsifiable_test, result, output: clipText(verdict.verdict_reasoning, 2000), treeHash },
       });
-      evidence.push({ findingId, result });
+      addEvidence({ findingId, result, treeHash });
       emit({ kind: "system", phase, round, message: `Falsifiable test for ${findingId} ${result === "TRUE" ? "reproduced the claim" : result === "FALSE" ? "did not reproduce the claim" : "was inconclusive"} (run by ${verifier.id}).` });
-      recordSpend(correlationId, verifier.id, phase, round, usage, Date.now() - started);
+      recordSpend(correlationId, verifier, phase, round, usage, elapsedMs(started), fullPrompt.length);
+      checkBudget();
     }
     return ran;
   };
   const rank = (seat: SeatConfig) => {
-    const index = VERIFIER_PREFERENCE.indexOf(seat.id);
+    const index = VERIFIER_PREFERENCE.indexOf(cliKind(seat));
     return index < 0 ? VERIFIER_PREFERENCE.length : index;
   };
 
@@ -618,6 +844,7 @@ async function runSessionCore(ctx: {
    */
   const deliberate = async (phase: Phase, round: number): Promise<PhaseSignal> => {
     const settledByHuman = humanRulings(currentProjection());
+    const treeHash = await computeTreeHash(worktreePath);
     const decisions: ArbitrationDecision[] = [];
     let verificationAllowance = MAX_VERIFICATIONS_PER_DELIBERATION;
     for (const contention of openContentions) {
@@ -638,7 +865,12 @@ async function runSessionCore(ctx: {
       }
 
       let decision: ArbitrationDecision;
-      const human = settledByHuman.get(contention.contentionId);
+      // A ruling settles the claims it was made on. The contention id is only a hash of the file, so
+      // a different problem in the same file (or, for bare rejections, a different objection) is
+      // arbitrated on its own merits, never closed by an earlier ruling about something else.
+      const human = settledByHuman.findLast(
+        (ruled) => ruled.contentionId === contention.contentionId && ruled.findingIds.length > 0 && contention.findingIds.every((id) => ruled.findingIds.includes(id)),
+      );
       if (human) {
         const upheld = human.ruling === "UPHELD";
         decision = {
@@ -649,9 +881,9 @@ async function runSessionCore(ctx: {
           reasoning: `Settled by a human arbiter: ${human.reasoning}`,
         };
       } else {
-        verificationAllowance -= await verifyClaims(contention, phase, round, verificationAllowance);
-        decision = arbitrate({ contention, findings: findingsById, evidence, activeSeatIds });
-        store.append(sessionId, { type: "ArbitrationRuled", payload: { contentionId: decision.contentionId, arbiters: decision.arbiters, ruling: decision.ruling, reasoning: decision.reasoning, source: "policy" } });
+        verificationAllowance -= await verifyClaims(contention, phase, round, verificationAllowance, treeHash);
+        decision = arbitrate({ contention, findings: findingsById, evidence: currentEvidence(treeHash), activeSeatIds });
+        store.append(sessionId, { type: "ArbitrationRuled", payload: { contentionId: decision.contentionId, arbiters: decision.arbiters, ruling: decision.ruling, reasoning: decision.reasoning, source: "policy", findingIds: contention.findingIds } });
       }
       store.append(sessionId, { type: "ContentionResolved", payload: { contentionId: decision.contentionId, terminalState: decision.terminalState } });
       emit({ kind: "system", phase, round, message: `Arbitration on ${contention.targets.join(", ")}: ${decision.ruling} — ${decision.reasoning}` });
@@ -670,6 +902,9 @@ async function runSessionCore(ctx: {
     openContentions = openContentions.filter((contention) => actionable.some((decision) => decision.contentionId === contention.contentionId));
     return actionable.length === 0 && pendingDefects.length === 0 ? "CONTENTIONS_RESOLVED" : "CONTENTIONS_UNRESOLVED";
   };
+
+  /** The findings a recorded contention holds. */
+  const contentionFindingIds = (contentionId: string): string[] => currentProjection().contentions[contentionId]?.findingIds ?? [];
 
   /** Takes a formal vote and records every ballot, including the ones that never arrived. */
   const ratify = async (phase: "RATIFY_PLAN" | "RATIFY_WORK", round: number): Promise<PhaseSignal> => {
@@ -697,8 +932,47 @@ async function runSessionCore(ctx: {
       store.append(sessionId, { type: "RatificationVoteMissing", payload: { phase, round, seat: absent.seat, reason: absent.reason } });
     }
 
-    const tally = tallyRatification({ votes, missing, activeSeatIds: electorate, minQuorum, openContentionSeverities: openContentions.map((contention) => contention.severity) });
-    emit({ kind: "system", phase, round, message: `${phase.replace("_", " ").toLowerCase()}: ${tally.reason}` });
+    // A dispute escalated to a human blocks ratification until a human rules on it, even when this
+    // round's audit did not raise it again (its claimant may simply not have answered).
+    const escalated = pendingHumanRulings(currentProjection()).filter((item) => !openContentions.some((open) => open.contentionId === item.contentionId));
+    const tally = tallyRatification({
+      votes,
+      missing,
+      activeSeatIds: electorate,
+      minQuorum,
+      openContentionSeverities: [...openContentions.map((contention) => contention.severity), ...escalated.map((item) => item.severity as ContentionCandidate["severity"])],
+    });
+    emit({ kind: "system", phase, round, message: `${phase === "RATIFY_PLAN" ? "Plan vote" : "Work vote"}: ${tally.reason}` });
+    if (!tally.ratified) {
+      const dissented = result.verdicts.some((verdict) => electorate.has(verdict.seat) && verdict.overall_verdict !== "APPROVE");
+      // Nobody objected; ballots were only missing (their seats have now dropped out). There is
+      // nothing for the executor to fix, so the council just votes again.
+      if (!dissented && missing.length > 0 && openContentions.length === 0 && escalated.length === 0) {
+        pendingDefects = [];
+        return "VOTE_INCOMPLETE";
+      }
+      // What the dissenters objected to is the work the next refine or remediation must do.
+      pendingDefects = result.verdicts
+        .filter((verdict) => electorate.has(verdict.seat) && verdict.overall_verdict !== "APPROVE")
+        .flatMap((verdict) => verdict.findings.length > 0 ? verdict.findings : [{
+          id: `${verdict.seat}:vote`,
+          seat: verdict.seat,
+          role: "SPEC_FIDELITY" as const,
+          target: OVERALL_TARGET,
+          category: "ratification-objection",
+          severity: "MAJOR" as const,
+          description: verdict.verdict_reasoning,
+          falsifiable_test: null,
+          confidence: 0.5,
+        }]);
+      // The escalated claims stay on the executor's list until a human rules on them.
+      for (const item of escalated) {
+        for (const id of contentionFindingIds(item.contentionId)) {
+          const finding = findingsById.get(id);
+          if (finding && !pendingDefects.some((defect) => defect.id === id)) pendingDefects.push(finding);
+        }
+      }
+    }
     return tally.ratified ? "RATIFIED" : "NOT_RATIFIED";
   };
 
@@ -775,6 +1049,8 @@ async function runSessionCore(ctx: {
     store.append(sessionId, { type: "ArtifactWritten", payload: { kind, version: 1, hash: createHash("sha256").update(content).digest("hex"), path } });
   };
 
+  /** Set once the terminal events are in the log: nothing after that may rewrite how the run ended. */
+  let concluded: CouncilRunResult | undefined;
   try {
     let step: SessionEntry = ctx.entry;
     let outcome: Extract<TransitionDecision, { kind: "terminal" }> | undefined;
@@ -837,7 +1113,8 @@ async function runSessionCore(ctx: {
       // The only path that ever removes a worktree: ratified work, after the branch already holds
       // the commit. Any other exit — unratified, thrown error, process death — leaves it on disk.
       await commitAndRemoveWorktree(worktree, `Conclave: ${task}`);
-      store.append(sessionId, { type: "WorktreeRemoved", payload: { reason: "work ratified; branch preserved" } });
+      const snapshot = currentProjection().worktree?.snapshot;
+      store.append(sessionId, { type: "WorktreeRemoved", payload: { reason: snapshot ? "work ratified; ready to apply to the folder" : "work ratified; branch preserved" } });
       store.append(sessionId, { type: "SessionConcluded", payload: { outcome: "APPROVED", reason: finalReason } });
     } else {
       store.append(sessionId, { type: "WorktreeKept", payload: { reason: finalReason } });
@@ -849,9 +1126,13 @@ async function runSessionCore(ctx: {
         store.append(sessionId, { type: "SessionConcluded", payload: { outcome: finalOutcome, reason: finalReason } });
       }
     }
+    concluded = { sessionId, approved, rounds, report };
     emit({ kind: "report", phase: "REPORT", message: report });
-    return { sessionId, approved, rounds, report };
+    return concluded;
   } catch (error) {
+    // The outcome is already recorded: a failure while announcing it must not be recorded as a second,
+    // contradictory ending (an approved session turned "errored", its worktree reported kept).
+    if (concluded) return concluded;
     const cancelled = error instanceof CliCancelledError || signal.aborted;
     // Why the run was cancelled (Ctrl-C, `conclave cancel`, the web UI) is more useful in the log
     // than the generic "seat: cancelled" error the interrupted invocation happened to throw.
@@ -879,14 +1160,37 @@ async function runSessionCore(ctx: {
   }
 }
 
+/**
+ * Records an activity and hands it to the caller's listener. The listener's own failure (the web
+ * server's broadcast, say) must never reach the council: after the verdict is recorded, a throw
+ * from here would turn an approved session into an errored one.
+ */
+function activityEmitter(store: EventStore, sessionId: string, onActivity?: (activity: CouncilActivity) => void) {
+  return (activity: Omit<CouncilActivity, "at">) => {
+    store.append(sessionId, { type: "ActivityLogged", payload: activity });
+    try {
+      onActivity?.({ at: new Date().toISOString(), ...activity });
+    } catch {
+      // A listener is a view of the log, never part of it.
+    }
+  };
+}
+
 export async function runCouncil(options: CouncilRunOptions): Promise<CouncilRunResult> {
   const seats = (options.seats ?? DEFAULT_CLI_SEATS).filter((seat) => seat.enabled);
   const minQuorum = Math.min(2, seats.length);
   if (seats.length < 1) throw new Error("Conclave requires at least one enabled seat");
   const claude = seats.find((seat) => seat.id === "claude");
   if (!claude) throw new Error("Claude must remain enabled: it is the only seat that executes and remediates code changes.");
-  const baseCommit = await assertValidRepository(options.cwd);
-  if (!options.allowDirtySource) await assertCleanRepository(options.cwd);
+  // A git repository runs on a worktree of itself. Anything else that is a folder — not a repository,
+  // one with no commits yet, or a folder that some parent repository neither tracks nor contains
+  // (a project inside a dotfiles-managed home) — runs on a private snapshot of it, and nothing in it
+  // changes until ratified work is explicitly applied.
+  const repo = await inspectRepository(options.cwd);
+  if (!repo.isDirectory) throw new Error(`${options.cwd} ${repo.exists ? "is not a folder" : "does not exist"}`);
+  const snapshotMode = !repo.useRepository;
+  const repoCommit = snapshotMode ? undefined : await assertValidRepository(options.cwd);
+  if (!snapshotMode && !options.allowDirtySource) await assertCleanRepository(options.cwd);
   const discussionCap = options.discussionRoundCap ?? 6;
   const remediationCap = options.remediationRoundCap ?? 3;
   const budgetCeilingUsd = options.budgetCeilingUsd ?? 20;
@@ -896,12 +1200,12 @@ export async function runCouncil(options: CouncilRunOptions): Promise<CouncilRun
   // Every emitted activity is also appended as a durable ActivityLogged event, so the master
   // chat and seat panes can be rebuilt from the event log alone after a browser/server restart,
   // not only from the in-memory onActivity broadcast (which is lost on restart).
-  const emit = (activity: Omit<CouncilActivity, "at">) => {
-    store.append(sessionId, { type: "ActivityLogged", payload: activity });
-    options.onActivity?.({ at: new Date().toISOString(), ...activity });
-  };
+  const emit = activityEmitter(store, sessionId, options.onActivity);
   const activeSeatIds = new Set(seats.map((seat) => seat.id));
   const lockPath = acquireSessionLock(options.dbPath, sessionId);
+  // A cancel request left by an earlier run of this id is stale; one made from here on — even while
+  // the worktree or snapshot is still being created — is honored once the council starts.
+  rmSync(cancelRequestPath(options.dbPath, sessionId), { force: true });
 
   let worktree: WorktreeHandle | undefined;
   try {
@@ -919,12 +1223,41 @@ export async function runCouncil(options: CouncilRunOptions): Promise<CouncilRun
       },
     });
     emit({ kind: "system", message: `Session opened. Consensus requires every available seat, with a minimum quorum of ${minQuorum}.` });
-    const created = await createWorktree(options.cwd, sessionId, baseCommit);
+    let created: WorktreeHandle;
+    let snapshotFiles = 0;
+    // A symlink pointing outside the tree would let a seat edit real files through the worktree,
+    // outside the isolation and invisible in the diff the council reviews: refuse before any seat runs.
+    const refuseEscapingSymlinks = async (repository: string, commit: string, cleanup?: () => Promise<void>) => {
+      const escaping = await escapingSymlinks(repository, commit);
+      if (escaping.length === 0) return;
+      await cleanup?.();
+      throw new UnsafeSymlinkError(
+        `${options.cwd} contains symlinks that point outside it (${escaping.slice(0, 5).join(", ")}${escaping.length > 5 ? ", …" : ""}); ` +
+          "the council's edits could reach through them into the real files. Remove or replace them, then run again.",
+      );
+    };
+    if (snapshotMode) {
+      const snapshot = await createSnapshotRepository(options.cwd, sessionId);
+      snapshotFiles = snapshot.fileCount;
+      await refuseEscapingSymlinks(snapshot.repository, snapshot.baseCommit, () => rm(snapshot.repository, { recursive: true, force: true }));
+      created = await createWorktree(snapshot.repository, sessionId, snapshot.baseCommit);
+    } else {
+      await refuseEscapingSymlinks(options.cwd, repoCommit!);
+      created = await createWorktree(options.cwd, sessionId, repoCommit!);
+    }
     worktree = created;
-    store.append(sessionId, { type: "WorktreeCreated", payload: { baseCommit: created.baseCommit, branch: created.branch, path: created.path } });
+    store.append(sessionId, {
+      type: "WorktreeCreated",
+      payload: { baseCommit: created.baseCommit, branch: created.branch, path: created.path, ...(snapshotMode ? { repository: created.sourceCwd, snapshot: true } : {}) },
+    });
     const beforeHash = await computeTreeHash(created.path);
     store.append(sessionId, { type: "WorktreeTreeHashRecorded", payload: { phase: "INTAKE", stage: "before", hash: beforeHash } });
-    emit({ kind: "system", message: `Isolated worktree created at ${created.path} on branch ${created.branch}. All work happens there — the source checkout is never mutated.` });
+    emit({
+      kind: "system",
+      message: snapshotMode
+        ? `${repo.isGitRepo ? "This folder isn't a committed part of a git repository" : "This folder isn't a git repository"}, so the council works on a private snapshot of it (${snapshotFiles} files) at ${created.path}. The folder itself is not modified; ratified changes are applied to it only when you choose to.`
+        : `Isolated worktree created at ${created.path} on branch ${created.branch}. All work happens there — the source checkout is never mutated.`,
+    });
   } catch (error) {
     const cancelled = error instanceof CliCancelledError || !!options.signal?.aborted;
     if (worktree) {
@@ -974,17 +1307,19 @@ export async function runCouncil(options: CouncilRunOptions): Promise<CouncilRun
  */
 export async function resumeCouncil(options: ResumeCouncilOptions): Promise<CouncilRunResult> {
   const lockPath = acquireSessionLock(options.dbPath, options.sessionId);
+  rmSync(cancelRequestPath(options.dbPath, options.sessionId), { force: true });
   const store = new EventStore(options.dbPath);
-  const emit = (activity: Omit<CouncilActivity, "at">) => {
-    store.append(options.sessionId, { type: "ActivityLogged", payload: activity });
-    options.onActivity?.({ at: new Date().toISOString(), ...activity });
-  };
+  const emit = activityEmitter(store, options.sessionId, options.onActivity);
   try {
     const events = store.replay(options.sessionId);
     if (events.length === 0) throw new Error(`no session found with id ${options.sessionId}`);
     const proj = projectSession(options.sessionId, events);
 
-    if (proj.outcome === "APPROVED" || (proj.worktreeRemoved && !proj.outcome)) {
+    // A removed worktree means "ratified" only when ratification removed it; logs written before the
+    // SessionConcluded event existed record that only in the removal reason. A pruned session that
+    // failed or was cancelled is not "completed successfully" — it just can't be resumed any more.
+    const ratifiedBeforeOutcomes = !proj.outcome && !!proj.worktreeRemoved && /ratified/.test(proj.worktreeRemoved.reason);
+    if (proj.outcome === "APPROVED" || ratifiedBeforeOutcomes) {
       throw new Error(`session ${options.sessionId} already completed successfully; nothing to resume`);
     }
     if (proj.worktreeRemoved) {
@@ -1011,30 +1346,29 @@ export async function resumeCouncil(options: ResumeCouncilOptions): Promise<Coun
         `session ${options.sessionId} is waiting on a human ruling for ${awaiting.map((item) => item.contentionId).join(", ")}; settle each with \`conclave arbitrate ${options.sessionId} <contention-id> uphold|dismiss --reason "<why>"\` before resuming`,
       );
     }
+    // Resuming would only spend past the ceiling the operator set, one more round at a time.
+    if (proj.spentUsd >= proj.budgetCeilingUsd) {
+      throw new Error(`session ${options.sessionId} has spent its budget ($${proj.spentUsd.toFixed(2)} of $${proj.budgetCeilingUsd.toFixed(2)}); start a new council with a higher --budget to continue the work`);
+    }
 
     const worktree: WorktreeHandle = {
       path: proj.worktree.path,
       branch: proj.worktree.branch,
       baseCommit: proj.worktree.baseCommit,
-      sourceCwd: proj.repoPath,
+      sourceCwd: proj.worktree.repository ?? proj.repoPath,
     };
     await assertResumableWorktree(worktree);
 
     const claude = proj.seats.find((seat) => seat.id === "claude");
     if (!claude) throw new Error(`session ${options.sessionId}'s recorded configuration has no claude seat`);
 
-    const activeSeatIds = new Set(proj.seats.map((seat) => seat.id));
-    for (const invocation of Object.values(proj.seatInvocations)) {
-      if (invocation.status !== "OK") activeSeatIds.delete(invocation.seat);
-    }
+    // Every configured seat gets another chance: a seat that failed before (a 429, a timeout) is
+    // usually fine now, and dropping it for good would leave a small council short of quorum forever.
+    // One that fails again drops out of this leg, as in any run.
+    const activeSeatIds = new Set(proj.seats.filter((seat) => seat.enabled !== false).map((seat) => seat.id));
 
-    const entry = resumeEntry({
-      phase: proj.currentPhase,
-      round: proj.currentRound,
-      phaseOpen: proj.phaseOpen,
-      lastPhaseOutcome: proj.lastPhaseOutcome,
-    });
-    emit({ kind: "system", message: `Resuming session ${options.sessionId} at ${entry.phase} round ${entry.round + 1}.` });
+    const { entry, discussionCap, remediationCap, upheld } = resumePlan(proj);
+    emit({ kind: "system", message: `Resuming session ${options.sessionId} at ${entry.phase} round ${entry.round + 1}${upheld?.contentions.length ? ", acting on the upheld ruling(s) with one more round granted" : ""}.` });
 
     const resumeReason = proj.cancelled
       ? `resumed after cancellation: ${proj.cancelReason ?? "unspecified"}`
@@ -1059,8 +1393,8 @@ export async function resumeCouncil(options: ResumeCouncilOptions): Promise<Coun
       claude,
       activeSeatIds,
       minQuorum: proj.minQuorum,
-      discussionCap: proj.discussionRoundCap,
-      remediationCap: proj.remediationRoundCap,
+      discussionCap,
+      remediationCap,
       budgetCeilingUsd: proj.budgetCeilingUsd,
       spentUsd: proj.spentUsd,
       worktree,
@@ -1068,6 +1402,7 @@ export async function resumeCouncil(options: ResumeCouncilOptions): Promise<Coun
       emit,
       entry,
       prior: proj,
+      upheld,
     });
   } catch (error) {
     store.close();
@@ -1075,6 +1410,64 @@ export async function resumeCouncil(options: ResumeCouncilOptions): Promise<Coun
   } finally {
     releaseSessionLock(lockPath);
   }
+}
+
+const PLAN_SIDE_PHASES: ReadonlySet<Phase> = new Set<Phase>(["INTAKE", "PLAN", "PLAN_AUDIT", "DELIBERATE", "PLAN_REFINE", "RATIFY_PLAN"]);
+
+/**
+ * Where a resume re-enters the phase graph, and with which round caps. Shared with the web UI, so
+ * what it says a resume will do is what the resume does.
+ */
+export function resumePlan(proj: SessionProjection): {
+  entry: SessionEntry;
+  discussionCap: number;
+  remediationCap: number;
+  upheld?: { contentions: ContentionCandidate[]; decisions: ArbitrationDecision[] };
+} {
+  let entry: SessionEntry = resumeEntry({ phase: proj.currentPhase, round: proj.currentRound, phaseOpen: proj.phaseOpen, lastPhaseOutcome: proj.lastPhaseOutcome });
+  let discussionCap = proj.discussionRoundCap ?? 6;
+  let remediationCap = proj.remediationRoundCap ?? 3;
+  // The council stopped at its round cap waiting on a human, and the human upheld at least one
+  // dispute. Re-auditing at that exhausted round could only end NOT_APPROVED — "uphold" would mean
+  // "reject". Instead, grant exactly one more cycle that starts by acting on the upheld claims.
+  const upheld = proj.outcome === "AWAITING_HUMAN" ? upheldByHuman(proj) : undefined;
+  if (upheld && upheld.contentions.length > 0) {
+    // Room for one more cycle from where the session stands — relative to the current round, so a
+    // second grant (after an earlier one) still leaves room to audit the revision.
+    if (PLAN_SIDE_PHASES.has(proj.currentPhase ?? "PLAN")) {
+      entry = { phase: "PLAN_REFINE", round: proj.currentRound };
+      discussionCap = Math.max(discussionCap, proj.currentRound + 2);
+    } else {
+      entry = { phase: "REMEDIATE", round: proj.currentRound + 1 };
+      remediationCap = Math.max(remediationCap, proj.currentRound + 2);
+    }
+  }
+  return { entry, discussionCap, remediationCap, upheld };
+}
+
+/** Contentions a human upheld (and that nothing has settled since), as work for the next leg. */
+function upheldByHuman(proj: SessionProjection): { contentions: ContentionCandidate[]; decisions: ArbitrationDecision[] } {
+  const contentions: ContentionCandidate[] = [];
+  const decisions: ArbitrationDecision[] = [];
+  for (const ruling of humanRulings(proj)) {
+    const { contentionId } = ruling;
+    const contention = proj.contentions[contentionId];
+    // Still standing: upheld, not since fixed (a later audit that no longer raises it supersedes it)
+    // and not since re-ruled on other claims.
+    const latest = proj.arbitrations[contentionId];
+    if (ruling.ruling !== "UPHELD" || contention?.status !== "ARBITRATED" || latest?.source !== "human") continue;
+    contentions.push({
+      contentionId,
+      targets: contention.targets,
+      category: contention.category,
+      severity: contention.severity,
+      findingIds: ruling.findingIds,
+      claimants: [...new Set(ruling.findingIds.map((id) => proj.findings[id]?.seat).filter((seat): seat is string => !!seat))],
+      dissenters: [],
+    });
+    decisions.push({ contentionId, arbiters: ["human"], ruling: "UPHELD", terminalState: "ARBITRATED", reasoning: `Upheld by a human arbiter: ${ruling.reasoning}` });
+  }
+  return { contentions, decisions };
 }
 
 /**
@@ -1094,31 +1487,78 @@ export function recordHumanRuling(input: {
   if (!reasoning) throw new Error("a human ruling needs a reason; it is shown to the council in later rounds");
   const store = new EventStore(input.dbPath);
   try {
-    const events = store.replay(input.sessionId);
-    if (events.length === 0) throw new Error(`no session found with id ${input.sessionId}`);
-    const proj = projectSession(input.sessionId, events);
-    const contention = proj.contentions[input.contentionId];
-    if (!contention) throw new Error(`session ${input.sessionId} has no contention ${input.contentionId}`);
-    if (contention.status !== "HUMAN_ARBITRATION") {
-      throw new Error(`contention ${input.contentionId} is ${contention.status}, not awaiting a human ruling`);
-    }
-    const arbiter = input.arbiter?.trim() || "human";
-    store.append(input.sessionId, {
-      type: "ArbitrationRuled",
-      payload: { contentionId: input.contentionId, arbiters: [arbiter], ruling: input.ruling, reasoning, source: "human" },
-    });
-    store.append(input.sessionId, {
-      type: "ContentionResolved",
-      payload: { contentionId: input.contentionId, terminalState: input.ruling === "UPHELD" ? "ARBITRATED" : "WITHDRAWN" },
-    });
-    store.append(input.sessionId, {
-      type: "ActivityLogged",
-      payload: { kind: "system", message: `Human arbiter ${arbiter} ${input.ruling === "UPHELD" ? "upheld" : "dismissed"} the contention on ${contention.targets.join(", ")}: ${reasoning}` },
-    });
+    // Check and record in one transaction: a running council could otherwise reopen this contention
+    // with a different claim between the check and the append, and the ruling would land on it.
+    store.transaction(() => recordHumanRulingLocked(store, input, reasoning));
   } finally {
     store.close();
   }
 }
+
+function recordHumanRulingLocked(
+  store: EventStore,
+  input: { sessionId: string; contentionId: string; ruling: "UPHELD" | "DISMISSED"; arbiter?: string },
+  reasoning: string,
+): void {
+  const events = store.replay(input.sessionId);
+  if (events.length === 0) throw new Error(`no session found with id ${input.sessionId}`);
+  const proj = projectSession(input.sessionId, events);
+  const contention = proj.contentions[input.contentionId];
+  if (!contention) throw new Error(`session ${input.sessionId} has no contention ${input.contentionId}`);
+  if (contention.status !== "HUMAN_ARBITRATION") {
+    throw new Error(`contention ${input.contentionId} is ${contention.status}, not awaiting a human ruling`);
+  }
+  const arbiter = input.arbiter?.trim() || "human";
+  store.append(input.sessionId, {
+    type: "ArbitrationRuled",
+    payload: { contentionId: input.contentionId, arbiters: [arbiter], ruling: input.ruling, reasoning, source: "human", findingIds: contention.findingIds },
+  });
+  store.append(input.sessionId, {
+    type: "ContentionResolved",
+    payload: { contentionId: input.contentionId, terminalState: input.ruling === "UPHELD" ? "ARBITRATED" : "WITHDRAWN" },
+  });
+  store.append(input.sessionId, {
+    type: "ActivityLogged",
+    payload: { kind: "system", message: `Human arbiter ${arbiter} ${input.ruling === "UPHELD" ? "upheld" : "dismissed"} the contention on ${contention.targets.join(", ")}: ${reasoning}` },
+  });
+}
+
+/**
+ * Writes a ratified snapshot session's changes into the plain folder it was run against — on the
+ * operator's explicit request only, and at most once. A git-repository session is never applied
+ * this way: its work is a branch, merged by the operator. `check` verifies without writing.
+ */
+export async function applySessionChanges(input: { dbPath: string; sessionId: string; check?: boolean }): Promise<{ target: string; files: AppliedChange[] }> {
+  if (isSessionActive(input.dbPath, input.sessionId)) throw new Error(`session ${input.sessionId} is still running, or its changes are being applied right now`);
+  // Held for the whole apply, so two requests (a double click, two tabs, the UI and the CLI) cannot
+  // both pass the "not applied yet" check and write the same changes twice.
+  const lockPath = acquireSessionLock(input.dbPath, input.sessionId);
+  const store = new EventStore(input.dbPath);
+  try {
+    const events = store.replay(input.sessionId);
+    if (events.length === 0) throw new Error(`no session found with id ${input.sessionId}`);
+    const proj = projectSession(input.sessionId, events);
+    const worktree = proj.worktree;
+    if (!worktree || !worktree.snapshot || !worktree.repository || !proj.repoPath) {
+      throw new Error(`session ${input.sessionId} ran on a git repository; its work is on branch ${worktree?.branch ?? "(none)"} — review and merge it yourself`);
+    }
+    if (proj.outcome !== "APPROVED") throw new Error(`only ratified work can be applied; session ${input.sessionId} is ${sessionStateLabel(proj)}`);
+    if (proj.applied) throw new Error(`session ${input.sessionId}'s changes were already applied at ${proj.applied.at}`);
+    const files = await applySnapshotChanges({ repository: worktree.repository, baseCommit: worktree.baseCommit, branch: worktree.branch, target: proj.repoPath, check: input.check });
+    if (!input.check) {
+      store.append(input.sessionId, { type: "ChangesApplied", payload: { target: proj.repoPath, files } });
+      store.append(input.sessionId, { type: "ActivityLogged", payload: { kind: "system", message: `Applied the ratified changes to the folder: ${files.length} file${files.length === 1 ? "" : "s"} (${files.map((file) => `${file.change === "added" ? "+" : file.change === "deleted" ? "-" : "~"}${file.path}`).join(", ")}).` } });
+    }
+    return { target: proj.repoPath, files };
+  } finally {
+    store.close();
+    releaseSessionLock(lockPath);
+  }
+}
+export { ApplyConflictError };
+
+const sessionStateLabel = (proj: SessionProjection) =>
+  proj.cancelled ? "cancelled" : proj.errored ? "errored" : proj.outcome ? proj.outcome.toLowerCase().replace("_", " ") : "not finished";
 
 /** Read-only session status: rebuilds the projection without touching any events or the worktree. */
 export function getSessionStatus(dbPath: string, sessionId: string): SessionProjection {
@@ -1183,9 +1623,22 @@ export function listSessionMessages(dbPath: string, sessionId: string, afterSeq 
  * Absolute filesystem paths (repo checkout, isolated worktree) tied to a session — used only to
  * redact those paths out of messages before they reach the browser, never sent to clients as-is.
  */
-export function sessionAbsolutePaths(dbPath: string, sessionId: string): string[] {
-  const proj = getSessionStatus(dbPath, sessionId);
-  return [proj.repoPath, proj.worktree?.path].filter((p): p is string => typeof p === "string" && p.length > 0);
+export function sessionAbsolutePaths(dbPath: string, sessionId: string): Array<{ path: string; label: string }> {
+  return projectionPaths(getSessionStatus(dbPath, sessionId));
+}
+
+/**
+ * Every absolute location a session's text can mention, labelled for redaction: its folder, its
+ * worktree, a plain folder's private snapshot, and — for anything else under it — the home directory.
+ */
+export function projectionPaths(proj: SessionProjection): Array<{ path: string; label: string }> {
+  const entries: Array<{ path: string | undefined; label: string }> = [
+    { path: proj.repoPath, label: "repository" },
+    { path: proj.worktree?.path, label: "worktree" },
+    { path: proj.worktree?.snapshot ? proj.worktree.repository : undefined, label: "snapshot" },
+    { path: homedir(), label: "~" },
+  ];
+  return entries.filter((entry): entry is { path: string; label: string } => typeof entry.path === "string" && entry.path.length > 0);
 }
 
 /** Persist a user's chat message as a durable event, independent of whether a council run follows. */

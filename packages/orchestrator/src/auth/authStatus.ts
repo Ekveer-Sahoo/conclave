@@ -1,32 +1,50 @@
 import { spawn } from "node:child_process";
 import type { SeatConfig } from "@conclave/core";
-import { seatCliOptions } from "../seats/cliAdapter.js";
+import { cliKind, commandFor, killProcessTree, seatCliOptions, timerMs } from "../seats/cliAdapter.js";
 import { xeniaAuthHeaders, xeniaBaseUrl } from "../seats/xeniaAdapter.js";
 
 /**
  * `binaryFound` keeps its name for existing callers' MISSING/FAIL labels. For a xenia seat it means
  * "gateway reachable", and for a fake seat it is always true.
  */
-export interface SeatAuthStatus { seat: string; adapter?: SeatConfig["adapter"]; cliCommand: string; binaryFound: boolean; healthy: boolean; detail: string; loginHint: string }
+export interface SeatAuthStatus {
+  seat: string;
+  adapter?: SeatConfig["adapter"];
+  cliCommand: string;
+  binaryFound: boolean;
+  healthy: boolean;
+  detail: string;
+  loginHint: string;
+  /** True when this seat was deliberately not probed (a CLI probe is a billed model call). */
+  unchecked?: boolean;
+}
 const LOGIN_HINTS: Record<string, string> = { claude: "claude /login", codex: "codex login", antigravity: "open the Antigravity app to sign in (no `agy login` subcommand exists)" };
+const PROBE_PROMPT = "Reply exactly OK";
 /**
  * The login probe for a CLI seat. It carries the seat's configured model and extra flags, so a seat
  * that only works with its configured model (or provider override) is judged the way a run uses it.
+ * A seat driven by an argument template is probed through that template, exactly as a run invokes it.
  */
 export function healthProbeArgs(seat: SeatConfig): string[] {
+  if (seat.cliArgsTemplate?.length && seat.cliCommand) return commandFor(seat, PROBE_PROMPT, "audit").args;
   const options = seatCliOptions(seat);
-  if (seat.id === "claude") return ["-p", "Reply exactly OK", "--output-format", "text", "--tools", "", ...options];
-  if (seat.id === "codex") return ["exec", "--sandbox", "read-only", "--color", "never", ...options, "Reply exactly OK"];
-  return ["-p", "Reply exactly OK", "--output-format", "text", "--sandbox", "--disable-slash-commands", ...options];
+  const kind = cliKind(seat);
+  if (kind === "claude") return ["-p", PROBE_PROMPT, "--output-format", "text", "--tools", "", ...options];
+  // The probe runs wherever doctor or the web server was started, which need not be a git repository.
+  if (kind === "codex") return ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", ...options, PROBE_PROMPT];
+  return ["-p", PROBE_PROMPT, "--output-format", "text", "--sandbox", "--disable-slash-commands", ...options];
 }
 async function checkCliSeatHealth(seat: SeatConfig, cwd: string, timeoutMs: number): Promise<SeatAuthStatus> {
   const command = seat.cliCommand ?? seat.id;
   return await new Promise((resolve) => {
-    const child = spawn(command, healthProbeArgs(seat), { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    // Detached, like a seat run, so a timeout can kill the CLI's whole process tree: a wrapper's
+    // child left running would keep making the (billed) call and keep this process alive.
+    const child = spawn(command, healthProbeArgs(seat), { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: process.platform !== "win32" });
     let output = ""; let settled = false;
     const finish = (status: Omit<SeatAuthStatus, "seat" | "adapter" | "cliCommand" | "loginHint">) => {
       if (settled) return; settled = true; clearTimeout(timer);
-      resolve({ seat: seat.id, adapter: "cli", cliCommand: command, loginHint: LOGIN_HINTS[seat.id] ?? `${command} login`, ...status });
+      const kind = cliKind(seat);
+      resolve({ seat: seat.id, adapter: "cli", cliCommand: command, loginHint: kind === "other" ? `${command} login` : LOGIN_HINTS[kind]!, ...status });
     };
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => output += chunk);
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => output += chunk);
@@ -36,7 +54,11 @@ async function checkCliSeatHealth(seat: SeatConfig, cwd: string, timeoutMs: numb
       // A healthy CLI's raw output is noise (hook logs, token counts); only a failure's output helps.
       finish({ binaryFound: true, healthy, detail: healthy ? "responded" : code === 0 ? output.trim().slice(-240) : `exit ${code}: ${output.trim().slice(-200)}` });
     });
-    const timer = setTimeout(() => { child.kill("SIGTERM"); finish({ binaryFound: true, healthy: false, detail: `health check timed out after ${timeoutMs}ms` }); }, timeoutMs);
+    const timer = setTimeout(() => {
+      killProcessTree(child, "SIGTERM");
+      setTimeout(() => killProcessTree(child, "SIGKILL"), 2_000).unref();
+      finish({ binaryFound: true, healthy: false, detail: `health check timed out after ${timeoutMs}ms` });
+    }, timerMs(timeoutMs));
   });
 }
 
@@ -155,3 +177,56 @@ export async function checkSeatHealth(seat: SeatConfig, cwd: string, timeoutMs =
   }
 }
 export async function checkAllSeatHealth(seats: SeatConfig[], cwd: string) { return await Promise.all(seats.map((seat) => checkSeatHealth(seat, cwd))); }
+
+export interface ModelProbeResult extends SeatAuthStatus {
+  /** The model tried; undefined means the seat's CLI default. */
+  model?: string;
+  /** The model the provider reports having answered with, when it says. */
+  answeredBy?: string;
+}
+
+/**
+ * Tries a model for real before a seat is switched to it: one tiny call, exactly as a run would make
+ * it (a CLI seat with its model and extra flags; a gateway seat with a real completion, not just a
+ * listing lookup — a listed model can still fail upstream). This spends a little; callers must only
+ * run it on an explicit request.
+ */
+export async function probeSeatModel(
+  seat: SeatConfig,
+  model: string | undefined,
+  cwd: string,
+  options: { timeoutMs?: number; fetchImpl?: typeof fetch } = {},
+): Promise<ModelProbeResult> {
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  if (seat.adapter === "cli") {
+    const candidate = { ...seat, cliModel: model?.trim() || undefined };
+    return { ...(await checkCliSeatHealth(candidate, cwd, timeoutMs)), model: candidate.cliModel };
+  }
+  if (seat.adapter === "fake") {
+    return { ...(await checkSeatHealth(seat, cwd)), model };
+  }
+  const target = model?.trim() || seat.xeniaModel;
+  const base = { seat: seat.id, adapter: "xenia" as const, cliCommand: `xenia:${target ?? "?"}`, loginHint: "pick a model the gateway lists, or check CONCLAVE_XENIA_BASE_URL / CONCLAVE_XENIA_API_KEY", model: target };
+  if (!target) return { ...base, binaryFound: true, healthy: false, detail: "no model given" };
+  try {
+    const response = await (options.fetchImpl ?? fetch)(`${xeniaBaseUrl()}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...xeniaAuthHeaders() },
+      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify({ model: target, max_tokens: 8, messages: [{ role: "user", content: "Reply exactly OK" }] }),
+    });
+    const text = await response.text();
+    if (!response.ok) return { ...base, binaryFound: true, healthy: false, detail: `gateway responded ${response.status}: ${text.slice(0, 200).trim()}` };
+    let body: { model?: string; choices?: Array<{ message?: { content?: unknown } }> };
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return { ...base, binaryFound: true, healthy: false, detail: `gateway answered ${response.status} with a non-JSON body: ${text.slice(0, 120).trim()}` };
+    }
+    const content = body.choices?.[0]?.message?.content;
+    const healthy = typeof content === "string" && /\bOK\b/i.test(content);
+    return { ...base, binaryFound: true, healthy, detail: healthy ? "responded" : `unexpected reply: ${String(content).slice(0, 120)}`, answeredBy: body.model };
+  } catch (error) {
+    return { ...base, binaryFound: false, healthy: false, detail: `gateway unreachable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}

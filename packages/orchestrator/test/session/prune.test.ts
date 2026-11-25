@@ -92,3 +92,17 @@ test("prune never touches a ratified session's branch, nor a session another pro
   assert.ok(existsSync(getSessionStatus(dbPath, running).worktree!.path));
   assert.equal(await branchExists(dir, ratifiedBranch), true, "the branch holding ratified work is the session's output and is never pruned");
 });
+
+test("a pruned session that was cancelled is reported as pruned on resume, not as 'completed successfully'", async () => {
+  const { dir, dbPath } = await setupRepo("prune-cancelled");
+  const controller = new AbortController();
+  registerFakeSeat("claude", ({ prompt }) => {
+    if (!prompt.includes("concrete implementation plan")) return { kind: "verdict", verdict: { overall_verdict: "APPROVE", verdict_reasoning: "ok" } };
+    controller.abort(new Error("stopped"));
+    return { kind: "hang" };
+  });
+  const result = await runCouncil({ task: "t", cwd: dir, dbPath, seats: council(), signal: controller.signal });
+  assert.equal(getSessionStatus(dbPath, result.sessionId).cancelled, true);
+  await pruneSessions({ dbPath, olderThanMs: 0, now: Date.now() + 60_000 });
+  await assert.rejects(() => resumeCouncil({ sessionId: result.sessionId, dbPath }), /worktree was removed/);
+});
