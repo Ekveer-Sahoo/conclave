@@ -34,13 +34,15 @@ export interface CommandCapture {
  *   (inferred from OpenAI Responses API usage conventions; not yet observed with a nonzero sample).
  * - antigravity: cachedInputTokens (cache_read_tokens) is a SUBSET already included in promptTokens
  *   (confirmed: total_tokens === input_tokens + output_tokens).
+ * - grok: like claude, cachedInputTokens (cache_read_input_tokens) is SEPARATE/ADDITIVE — Grok Build's
+ *   `streaming-messages-json` result reports the three Messages-API buckets disjoint, input_tokens uncached.
  */
 export interface ProviderUsage {
   promptTokens: number;
   completionTokens: number;
   cachedInputTokens?: number;
   costUsd?: number;
-  source: "claude_envelope" | "codex_envelope" | "antigravity_envelope" | "xenia_envelope" | "fake";
+  source: "claude_envelope" | "codex_envelope" | "antigravity_envelope" | "grok_envelope" | "xenia_envelope" | "fake";
 }
 
 export interface CliSeatOutcome {
@@ -168,7 +170,37 @@ function extractAntigravityUsage(stdout: string): ProviderUsage | null {
   return null;
 }
 
-export type CliKind = "claude" | "codex" | "antigravity" | "other";
+/**
+ * Grok Build (`grok -p … --output-format streaming-messages-json`) ends with a Messages-API-shaped
+ * `result` record. Its `usage` always carries numeric buckets, even when Grok could not account for
+ * them: an all-zero usage means "unknown", not "free", so it is reported as unavailable. Likewise a
+ * `total_cost_usd` of 0 is Grok's fallback for an unreported cost, so only a positive cost is kept.
+ */
+function extractGrokUsage(stdout: string): ProviderUsage | null {
+  for (const value of reverseLines(stdout)) {
+    const record = value as Record<string, unknown>;
+    if (record.type !== "result") continue;
+    const usage = record.usage as Record<string, unknown> | undefined;
+    if (!usage) return null;
+    const inputTokens = sanitizeTokenCount(usage.input_tokens);
+    const completionTokens = sanitizeTokenCount(usage.output_tokens);
+    if (inputTokens === undefined || completionTokens === undefined) return null;
+    const cacheWrite = sanitizeTokenCount(usage.cache_creation_input_tokens) ?? 0;
+    const cacheRead = sanitizeTokenCount(usage.cache_read_input_tokens) ?? 0;
+    if (inputTokens + completionTokens + cacheWrite + cacheRead === 0) return null;
+    const cost = sanitizeCostUsd(record.total_cost_usd);
+    return {
+      promptTokens: inputTokens + cacheWrite,
+      completionTokens,
+      cachedInputTokens: cacheRead || undefined,
+      costUsd: cost && cost > 0 ? cost : undefined,
+      source: "grok_envelope",
+    };
+  }
+  return null;
+}
+
+export type CliKind = "claude" | "codex" | "antigravity" | "grok" | "other";
 
 /**
  * Which CLI a seat drives: from its id, or else its command's name — so a seat renamed to, say,
@@ -180,6 +212,7 @@ export function cliKind(seat: Pick<SeatConfig, "id" | "cliCommand">): CliKind {
   if (seat.id === "claude" || command === "claude") return "claude";
   if (seat.id === "codex" || command === "codex") return "codex";
   if (seat.id === "antigravity" || command === "agy") return "antigravity";
+  if (seat.id === "grok" || command === "grok") return "grok";
   return "other";
 }
 
@@ -191,6 +224,7 @@ export function extractProviderUsage(seat: Pick<SeatConfig, "id" | "cliCommand">
     if (kind === "claude") return extractClaudeUsage(stdout);
     if (kind === "codex") return extractCodexUsage(stdout);
     if (kind === "antigravity") return extractAntigravityUsage(stdout);
+    if (kind === "grok") return extractGrokUsage(stdout);
     return null;
   } catch {
     return null;
@@ -316,6 +350,26 @@ const VERIFICATION_COMMAND_PREFIXES = [
 
 const AUDIT_ALLOWED_BASH = VERIFICATION_COMMAND_PREFIXES.flatMap((prefix) => [`Bash(${prefix})`, `Bash(${prefix} *)`]);
 
+/** Grok Build takes one rule per `--allow`, in the same `Bash(<glob>)` syntax as Claude Code. */
+const GROK_ALLOW_ARGS = AUDIT_ALLOWED_BASH.flatMap((rule) => ["--allow", rule]);
+
+/**
+ * Grok tools a council seat never needs: web access, media generation, subagents, scheduling, and
+ * questions to a user who is not there. Audits also lose the file-writing tools (GROK_AUDIT_WRITE_TOOLS).
+ */
+const GROK_DISALLOWED_TOOLS = [
+  "web_search", "web_fetch", "image_gen", "image_edit", "image_to_video", "reference_to_video",
+  "task", "workflow", "scheduler_create", "scheduler_delete", "monitor", "ask_user_question", "send_feedback",
+];
+const GROK_AUDIT_WRITE_TOOLS = ["write", "search_replace"];
+
+/**
+ * Grok's `dontAsk` mode denies every command no allow rule covers, except the ones it treats as
+ * read-only on its own, which include bare `touch` and `mkdir`. An audit must not create files in
+ * the worktree every seat is reading, so those are denied outright (deny always beats allow).
+ */
+const GROK_AUDIT_DENY_ARGS = ["--deny", "Bash(touch*)", "--deny", "Bash(mkdir*)"];
+
 /** Steers seats toward the one command-execution path this environment actually allows
  * (`node --test` against a checked-in test file). Appended to prompts rather than expanding
  * VERIFICATION_COMMAND_PREFIXES — arbitrary inline `node -e` stays denied; this just tells the
@@ -398,6 +452,25 @@ export function commandFor(seat: SeatConfig, prompt: string, mode: "audit" | "ex
       // trigger entirely instead of trying to react to it after the fact.
       const antigravityPrompt = `${prompt}\n\nDo not run any shell, terminal, or command-tool actions in this environment — every command call is denied unconditionally and a denied call returns an empty, unusable response instead of an error you could recover from. Review by reading files only.`;
       return { command, args: ["-p", antigravityPrompt, "--output-format", "json", "--json-schema", JSON_SCHEMA, "--sandbox", "--disable-slash-commands", ...modelArgs] };
+    }
+    case "grok": {
+      // streaming-messages-json is the Messages stream-json wire format: assistant tool_use blocks,
+      // user tool_result blocks, and a closing `result` record carrying structured_output, usage,
+      // and cost. Memory and subagents are off so a seat's answer depends only on this prompt.
+      const common = [
+        "-p", `${prompt}${VERIFICATION_GUIDANCE}`,
+        "--output-format", "streaming-messages-json",
+        "--json-schema", JSON_SCHEMA,
+        "--no-memory", "--no-subagents", "--disable-web-search",
+        ...GROK_ALLOW_ARGS,
+      ];
+      return mode === "execute"
+        ? { command, args: [...common, "--permission-mode", "acceptEdits", "--sandbox", "workspace", "--disallowed-tools", GROK_DISALLOWED_TOOLS.join(","), ...modelArgs] }
+        // Audits and votes are read-only, pinned rather than inherited from the operator's Grok
+        // config: no edit tools, deny-by-default commands, and the read-only sandbox. That sandbox
+        // leaves /tmp writable (where council worktrees live), so the tool and command limits are
+        // what actually keep an audit from writing there.
+        : { command, args: [...common, "--permission-mode", "dontAsk", "--sandbox", "read-only", "--disallowed-tools", [...GROK_DISALLOWED_TOOLS, ...GROK_AUDIT_WRITE_TOOLS].join(","), ...GROK_AUDIT_DENY_ARGS, ...modelArgs] };
     }
     default:
       return { command, args: [...modelArgs, prompt] };
@@ -505,7 +578,14 @@ function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((item) => (item && typeof item === "object" && typeof (item as Record<string, unknown>).text === "string" ? ((item as Record<string, unknown>).text as string) : ""))
+      .map((item) => {
+        if (!item || typeof item !== "object") return "";
+        const block = item as Record<string, unknown>;
+        if (typeof block.text === "string") return block.text;
+        // Grok Build wraps an error's text one level down: {type: "content", content: {type: "text", text}}.
+        const inner = block.content as Record<string, unknown> | undefined;
+        return inner && typeof inner === "object" && typeof inner.text === "string" ? inner.text : "";
+      })
       .join("\n");
   }
   return "";
@@ -528,6 +608,30 @@ function codexCommandCapture(item: Record<string, unknown>): CommandCapture | nu
   return { command, result, exitCode, output: result === "DENIED" ? "" : sanitizeOutput(output) };
 }
 
+/** Grok Build's shell tool, under its model-facing name and its internal id. */
+const GROK_SHELL_TOOLS = new Set(["run_terminal_command", "run_terminal_cmd"]);
+
+/** A Grok tool call its permission policy refused: an error result saying it was not executed. */
+const GROK_NOT_EXECUTED = /was not executed|was not run|Denied by permission policy|permission required/i;
+
+/**
+ * A Grok shell tool_result, reduced to a capture. Its content is a JSON string carrying the exit
+ * code and the output the model saw; a refused call is an error result with a plain-text reason.
+ */
+function grokShellCapture(command: string, outcome: { text: string; isError: boolean }): CommandCapture {
+  if (outcome.isError && GROK_NOT_EXECUTED.test(outcome.text)) return { command, result: "DENIED", output: "" };
+  try {
+    const body = JSON.parse(outcome.text) as Record<string, unknown>;
+    const exitCode = typeof body.exit_code === "number" && Number.isInteger(body.exit_code) ? body.exit_code : undefined;
+    const output = typeof body.output_for_prompt === "string" ? body.output_for_prompt.replace(/^exit: -?\d+\n/, "") : "";
+    const result: CommandVerificationResult =
+      body.timed_out === true || exitCode === undefined ? "INCONCLUSIVE" : exitCode === 0 ? "PASS" : "FAIL";
+    return { command, result, exitCode, output: sanitizeOutput(output) };
+  } catch {
+    return { command, result: outcome.isError ? "FAIL" : "INCONCLUSIVE", output: sanitizeOutput(outcome.text) };
+  }
+}
+
 function extractExitCode(output: string): number | undefined {
   const match = output.match(/\bexit(?:ed)? (?:code )?(\d+)\b/i);
   return match ? Number(match[1]) : undefined;
@@ -535,8 +639,8 @@ function extractExitCode(output: string): number | undefined {
 
 /**
  * Reconstructs which allowlisted verification commands a seat actually ran from its raw CLI
- * output. Works against claude's `--output-format stream-json` (NDJSON tool_use/tool_result
- * blocks), codex's `--json` event stream (completed `command_execution` items), and plain
+ * output. Works against claude's `--output-format stream-json` and grok's
+ * `--output-format streaming-messages-json` (NDJSON tool_use/tool_result blocks), codex's `--json` event stream (completed `command_execution` items), and plain
  * `--output-format json`/other seats, where only permission-denied commands are recoverable (from
  * `permission_denials`) since no tool transcript is present. Never throws — malformed or
  * unrecognized lines are skipped.
@@ -545,6 +649,7 @@ export function parseCommandCaptures(rawStdout: string, permissionDenials: unkno
   const commandsByToolUseId = new Map<string, string>();
   const resultsByToolUseId = new Map<string, { text: string; isError: boolean }>();
   const deniedToolUseIds = new Set<string>();
+  const grokToolUseIds = new Set<string>();
   const codexCaptures: CommandCapture[] = [];
 
   for (const denial of permissionDenials) {
@@ -580,9 +685,11 @@ export function parseCommandCaptures(rawStdout: string, permissionDenials: unkno
       for (const item of content) {
         if (!item || typeof item !== "object") continue;
         const block = item as Record<string, unknown>;
-        if (block.type === "tool_use" && block.name === "Bash" && typeof block.id === "string") {
+        const isGrokShell = typeof block.name === "string" && GROK_SHELL_TOOLS.has(block.name);
+        if (block.type === "tool_use" && (block.name === "Bash" || isGrokShell) && typeof block.id === "string") {
           const input = block.input as Record<string, unknown> | undefined;
           if (input && typeof input.command === "string") commandsByToolUseId.set(block.id, input.command);
+          if (isGrokShell) grokToolUseIds.add(block.id);
         }
       }
     } else if (record.type === "user") {
@@ -606,6 +713,10 @@ export function parseCommandCaptures(rawStdout: string, permissionDenials: unkno
     const outcome = resultsByToolUseId.get(toolUseId);
     if (!outcome) {
       captures.push({ command, result: "INCONCLUSIVE", output: "" });
+      continue;
+    }
+    if (grokToolUseIds.has(toolUseId)) {
+      captures.push(grokShellCapture(command, outcome));
       continue;
     }
     captures.push({

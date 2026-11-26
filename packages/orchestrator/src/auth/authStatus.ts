@@ -18,7 +18,7 @@ export interface SeatAuthStatus {
   /** True when this seat was deliberately not probed (a CLI probe is a billed model call). */
   unchecked?: boolean;
 }
-const LOGIN_HINTS: Record<string, string> = { claude: "claude /login", codex: "codex login", antigravity: "open the Antigravity app to sign in (no `agy login` subcommand exists)" };
+const LOGIN_HINTS: Record<string, string> = { claude: "claude /login", codex: "codex login", antigravity: "open the Antigravity app to sign in (no `agy login` subcommand exists)", grok: "grok login" };
 const PROBE_PROMPT = "Reply exactly OK";
 /**
  * The login probe for a CLI seat. It carries the seat's configured model and extra flags, so a seat
@@ -32,6 +32,7 @@ export function healthProbeArgs(seat: SeatConfig): string[] {
   if (kind === "claude") return ["-p", PROBE_PROMPT, "--output-format", "text", "--tools", "", ...options];
   // The probe runs wherever doctor or the web server was started, which need not be a git repository.
   if (kind === "codex") return ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", ...options, PROBE_PROMPT];
+  if (kind === "grok") return ["-p", PROBE_PROMPT, "--output-format", "plain", "--no-memory", "--no-subagents", "--disable-web-search", "--permission-mode", "dontAsk", "--sandbox", "read-only", ...options];
   return ["-p", PROBE_PROMPT, "--output-format", "text", "--sandbox", "--disable-slash-commands", ...options];
 }
 async function checkCliSeatHealth(seat: SeatConfig, cwd: string, timeoutMs: number): Promise<SeatAuthStatus> {

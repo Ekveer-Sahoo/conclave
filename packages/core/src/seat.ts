@@ -49,4 +49,5 @@ export const DEFAULT_CLI_SEATS: SeatConfig[] = [
   { id: "claude", label: "Claude Code", adapter: "cli", cliCommand: "claude", role: "ARCHITECTURE", temperature: 0.2, maxTokens: 4096, timeoutMs: 120_000, enabled: true, tier: "standard" },
   { id: "codex", label: "Codex CLI", adapter: "cli", cliCommand: "codex", role: "CORRECTNESS", temperature: 0.2, maxTokens: 4096, timeoutMs: 120_000, enabled: true, tier: "standard" },
   { id: "antigravity", label: "Antigravity CLI", adapter: "cli", cliCommand: "agy", role: "TESTABILITY", temperature: 0.2, maxTokens: 4096, timeoutMs: 120_000, enabled: true, tier: "standard" },
+  { id: "grok", label: "Grok Build", adapter: "cli", cliCommand: "grok", role: "SECURITY", temperature: 0.2, maxTokens: 4096, timeoutMs: 120_000, enabled: true, tier: "standard" },
 ];

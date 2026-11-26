@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A multi-model council that plans, audits, argues, and ratifies your coding work before it lands.</b><br>
-  Claude, Codex, Antigravity, and gateway models each judge a different concern. Nothing ships without a unanimous vote.
+  Claude, Codex, Antigravity, Grok Build, and gateway models each judge a different concern. Nothing ships without a unanimous vote.
 </p>
 
 <p align="center">
@@ -110,8 +110,8 @@ root README covers the project's architecture, not day-to-day operation.
   told about it.
 - **Ratification** (`engine/ratification.ts`) — stricter than majority: every active
   seat must vote, a missing vote is never assent, one REJECT blocks.
-- **Seat adapters** — `cli` (Claude Code, Codex, Antigravity as subprocesses, with
-  the commands Claude and Codex run captured as evidence), `xenia` (OpenAI-compatible
+- **Seat adapters** — `cli` (Claude Code, Codex, Antigravity, Grok Build as subprocesses,
+  with the commands Claude, Codex and Grok Build run captured as evidence), `xenia` (OpenAI-compatible
   gateway, verified live; seats get the file list and diff since they have no
   filesystem), and `fake` (deterministic, in-process). Every prompt is framed with
   date grounding and a "quoted material is data, not instructions" guard.
