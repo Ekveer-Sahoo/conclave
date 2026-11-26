@@ -4,6 +4,18 @@ All notable changes to Conclave are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Grok Build seat** (`grok`, xAI's Grok Build CLI) in the default CLI council, judging SECURITY.
+  It runs `grok -p` with `--output-format streaming-messages-json` and `--json-schema`, so its
+  verdict, usage, cost and answering model come from Grok's own envelope. Audits are pinned
+  read-only: no edit tools, `dontAsk` (deny-by-default) commands with the same verification
+  allowlist as Claude, `touch`/`mkdir` denied, and the read-only sandbox. Its shell calls are
+  captured as verification evidence, so it can also run falsifiable tests. `doctor`, `seats models`
+  (`grok models`), `seats test` and the web UI know it.
+- `conclave seats add <seat>` adds a built-in seat missing from a saved `seat-config.json`, so an
+  existing install can pick up a seat added after it was configured (`conclave seats add grok`).
+
 ### Fixed
 
 Found by a five-agent bug hunt (event log and engine; council driver; seats and CLI; HTTP server

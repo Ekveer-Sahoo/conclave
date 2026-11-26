@@ -47,6 +47,7 @@ const PRICING_PER_1K_TOKENS: Record<string, { prompt: number; completion: number
   claude: { prompt: 0.003, completion: 0.015 },
   codex: { prompt: 0.002, completion: 0.008 },
   antigravity: { prompt: 0.00125, completion: 0.005 },
+  grok: { prompt: 0.002, completion: 0.01 },
 };
 function estimateCostUsd(seat: SeatConfig, promptTokens: number, completionTokens: number): number {
   const rate = PRICING_PER_1K_TOKENS[cliKind(seat)] ?? { prompt: 0.002, completion: 0.008 };
@@ -420,7 +421,7 @@ const clipText = (text: string, max: number) => (text.length > max ? `${text.sli
  * Seats whose command executions are captured from their output, so a verification they run
  * produces evidence rather than an unverifiable claim. Ordered by preference.
  */
-const VERIFIER_PREFERENCE = ["claude", "codex"];
+const VERIFIER_PREFERENCE = ["claude", "codex", "grok"];
 const canVerify = (seat: SeatConfig) => seat.adapter === "fake" || (seat.adapter === "cli" && VERIFIER_PREFERENCE.includes(cliKind(seat)));
 
 const COMMAND_EXECUTED: ReadonlySet<CommandCapture["result"]> = new Set(["PASS", "FAIL"]);

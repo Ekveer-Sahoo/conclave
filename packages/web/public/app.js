@@ -87,7 +87,7 @@ const STANCES = {
 const TONES = new Set(["success", "warning", "danger", "attention", "info", "neutral"]);
 const TABS = ["overview", "timeline", "findings", "disputes"];
 const SEAT_HUES = [45, 250, 165, 330, 95, 205];
-const KNOWN_INITIALS = { claude: "Cl", codex: "Cx", antigravity: "Ag" };
+const KNOWN_INITIALS = { claude: "Cl", codex: "Cx", antigravity: "Ag", grok: "Gk" };
 
 const CHEVRON = `<svg class="chev" viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M4.5 2.5 8 6l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 

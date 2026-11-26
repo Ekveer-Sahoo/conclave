@@ -191,6 +191,49 @@ function listCliModels(command: string, timeoutMs: number): Promise<ModelOption[
   });
 }
 
+/**
+ * `grok models` → its "Available models:" list, one per line as "  * id (default)" or "  - id".
+ * Exported for tests.
+ */
+export function parseGrokModels(stdout: string): { models: ModelOption[]; defaultModel?: string } {
+  const models: ModelOption[] = [];
+  let defaultModel: string | undefined;
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*([*-])\s+([\w.:/-]+)\s*(\(default\))?\s*$/.exec(line);
+    if (!match) continue;
+    const id = match[2]!;
+    const isDefault = match[1] === "*" || Boolean(match[3]);
+    if (isDefault) defaultModel = id;
+    models.push({ id, label: isDefault ? "Your Grok default" : undefined });
+  }
+  return { models, defaultModel };
+}
+
+/** Runs `<command> models` and returns its stdout (detached, so a timeout kills the whole tree). */
+function runModelsCommand(command: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, ["models"], { stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: process.platform !== "win32" });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      killProcessTree(child, "SIGTERM");
+      setTimeout(() => killProcessTree(child, "SIGKILL"), 2_000).unref();
+      reject(new Error(`\`${command} models\` timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`\`${command} models\` exited ${code}: ${stderr.trim().slice(0, 200)}`));
+      resolve(stdout);
+    });
+  });
+}
+
 async function gatewayModels(timeoutMs: number, fetchImpl: typeof fetch): Promise<ModelOption[]> {
   const response = await fetchImpl(`${xeniaBaseUrl()}/v1/models`, {
     headers: xeniaAuthHeaders(),
@@ -279,6 +322,23 @@ export async function modelCatalog(
         return { ...base, current, models, source: "agy models", authoritative: models.length > 0, ...(models.length ? {} : { note: "agy listed no models (is it signed in?). Any id agy accepts works." }) };
       } catch (error) {
         return { ...base, current, models: [], source: "agy models", authoritative: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    case "grok":
+      try {
+        const { models, defaultModel } = parseGrokModels(await runModelsCommand(seat.cliCommand ?? "grok", timeoutMs));
+        // Grok also accepts custom models defined in its config, which this list may not show.
+        return {
+          ...base,
+          current,
+          models,
+          defaultModel,
+          defaultSource: defaultModel ? "grok models" : undefined,
+          source: "grok models",
+          authoritative: false,
+          note: models.length ? "The models your Grok account can use. Custom models from your Grok config also work." : "grok listed no models (is it signed in? try `grok login`). Any id grok accepts works.",
+        };
+      } catch (error) {
+        return { ...base, current, models: [], source: "grok models", authoritative: false, error: error instanceof Error ? error.message : String(error) };
       }
     default:
       return { ...base, current, models: [], source: "none", authoritative: false, note: "No model list is known for this CLI; any id it accepts works." };

@@ -2,6 +2,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { DEFAULT_CLI_SEATS } from "@conclave/core";
 import { checkAllSeatHealth, probeSeatModel, suggestXeniaModels } from "../auth/authStatus.js";
 import { applyModelOverrides, modelCatalog, parseModelOverrides } from "../seats/modelCatalog.js";
 import { SeatConfigInvalidError, SeatConfigStore } from "../http/seatConfigStore.js";
@@ -29,7 +30,7 @@ const HELP = `Usage: conclave run "<question or task>" [--cwd <path>] [--db <pat
        conclave arbitrate <session-id> [<contention-id> uphold|dismiss --reason "<why>"] [--db <path>]
        conclave prune --older-than <days> [--dry-run] [--db <path>]
        conclave apply <session-id> [--check] [--db <path>]
-       conclave seats [models <seat> | set <seat> <model> [--force] | reset <seat> | test <seat> [<model>] | enable <seat> | disable <seat>] [--replace-invalid]
+       conclave seats [models <seat> | set <seat> <model> [--force] | reset <seat> | test <seat> [<model>] | enable <seat> | disable <seat> | add <seat>] [--replace-invalid]
        conclave doctor
 
 Commands:
@@ -43,7 +44,8 @@ Commands:
   apply <id>      Write a ratified session's changes into the plain (non-git) folder it ran on.
                   --check (or --dry-run) lists what would change without writing anything.
   seats           Show each seat and the model it uses; list, switch, test, or reset a seat's model,
-                  or enable/disable a seat. Changes apply to new councils.
+                  enable/disable a seat, or add a built-in seat (e.g. grok) missing from a saved
+                  config. Changes apply to new councils.
   doctor          Check that every configured seat's provider is installed and reachable.
 
 Options:
@@ -359,13 +361,26 @@ try {
       console.log(`${result.healthy ? "OK  " : "FAIL"} ${seat.id} · ${result.model ?? "default model"}${result.answeredBy && result.answeredBy !== result.model ? ` (answered by ${result.answeredBy})` : ""} — ${result.detail}`);
       if (!result.healthy && result.loginHint) console.log(`     fix: ${result.loginHint}`);
       process.exitCode = result.healthy ? 0 : 1;
+    } else if (sub === "add") {
+      const available = DEFAULT_CLI_SEATS.filter((seat) => !seats.some((s) => s.id === seat.id));
+      const builtIn = DEFAULT_CLI_SEATS.find((seat) => seat.id === seatId);
+      if (!builtIn) fail(`${seatId ? `No built-in seat named "${seatId}". ` : ""}Built-in seats: ${DEFAULT_CLI_SEATS.map((seat) => seat.id).join(", ")}`);
+      if (seats.some((seat) => seat.id === builtIn.id)) fail(`${builtIn.id} is already in your seats${available.length ? `; seats you can add: ${available.map((seat) => seat.id).join(", ")}` : ""}.`);
+      try {
+        config.save([...seats, { ...builtIn }], { expectedVersion: version, replaceInvalid: args.flags.has("--replace-invalid") });
+      } catch (error) {
+        if (error instanceof SeatConfigInvalidError) fail(`${error.message}\nNothing was changed. To overwrite it with the default seats plus this change, add --replace-invalid.`);
+        fail(error instanceof Error ? error.message : String(error));
+      }
+      console.log(`${builtIn.id} (${builtIn.label}, ${builtIn.role}) added for new councils.`);
+      console.log(`Check it can answer (one small billed call): conclave seats test ${builtIn.id}`);
     } else if (sub === "enable" || sub === "disable") {
       const seat = find(seatId);
       if (sub === "disable" && seat.id === "claude") fail("Claude must remain enabled: it is the only seat that plans, executes and remediates.");
       replace(seat.id, (s) => ({ ...s, enabled: sub === "enable" }));
       console.log(`${seat.id} ${sub === "enable" ? "enabled" : "disabled"} for new councils.`);
     } else {
-      fail("Usage: conclave seats [models <seat> | set <seat> <model> | reset <seat> | test <seat> [<model>] | enable <seat> | disable <seat>]");
+      fail("Usage: conclave seats [models <seat> | set <seat> <model> | reset <seat> | test <seat> [<model>] | enable <seat> | disable <seat> | add <seat>]");
     }
   } else if (command === "list") {
     const dbPath = option("--db") ?? defaultDbPath(process.cwd());

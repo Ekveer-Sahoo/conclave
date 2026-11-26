@@ -42,7 +42,7 @@ conclave doctor
 
 `doctor` checks every configured seat the way that seat is actually invoked:
 
-- **`cli` seats** (`claude`, `codex`, `antigravity`): whether the CLI binary is on `PATH`, and
+- **`cli` seats** (`claude`, `codex`, `antigravity`, `grok`): whether the CLI binary is on `PATH`, and
   whether it can actually respond (i.e. is authenticated). This probe is a real, tiny model call.
 - **`xenia` seats**: whether the gateway answers and lists the seat's `xeniaModel` in `/v1/models`
   (no tokens spent). A missing model is reported with up to three close matches.
@@ -70,6 +70,7 @@ Conclave never stores provider credentials. CLI seats use each provider's own lo
 | Claude | `claude` | Install [Claude Code](https://claude.com/claude-code), then run `claude` once and complete its login flow. |
 | Codex | `codex` | Install the OpenAI Codex CLI, then run `codex login`. |
 | Antigravity | `agy` | Install the Antigravity CLI, then run `agy` and complete its interactive login (there is no separate `agy login` subcommand). |
+| Grok Build | `grok` | Install xAI's Grok Build CLI, then run `grok login` (a grok.com sign-in or an xAI API key). |
 | Xenia seats | — | Point `CONCLAVE_XENIA_BASE_URL` at an OpenAI-compatible gateway. If it enforces keys, set `CONCLAVE_XENIA_API_KEY` (sent as a bearer token, never logged). |
 
 `conclave doctor` distinguishes "binary/gateway missing" (`MISSING`) from "present but failing"
@@ -243,7 +244,7 @@ next deliberation round picks it up.
 
 Seat configuration is a JSON file at `CONCLAVE_SEAT_CONFIG_PATH` (default
 `~/.conclave/seat-config.json`), editable directly or via the web UI (`GET`/`PUT /api/seats`). The
-default is `DEFAULT_CLI_SEATS` from `@conclave/core` (`claude`, `codex`, `antigravity`). The file is
+default is `DEFAULT_CLI_SEATS` from `@conclave/core` (`claude`, `codex`, `antigravity`, `grok`). The file is
 `{"version": <number>, "seats": [...]}` and every seat is validated against the seat schema when it
 is loaded. An invalid file is reported by `doctor` and the web UI, and nothing uses the fallback
 defaults silently: `conclave run` refuses to start, `doctor` probes nothing, and a `conclave seats`
@@ -256,7 +257,7 @@ Each seat's `adapter` selects how it is invoked:
 
 | Adapter | How it runs | Notes |
 | --- | --- | --- |
-| `cli` | Spawns the provider's own CLI (`cliCommand`, optional `cliModel`, optional `cliExtraArgs`, or a full `cliArgsTemplate`). | What the default council uses. Claude and Codex seats also have the commands they run captured as verification evidence. |
+| `cli` | Spawns the provider's own CLI (`cliCommand`, optional `cliModel`, optional `cliExtraArgs`, or a full `cliArgsTemplate`). | What the default council uses. Claude, Codex and Grok Build seats also have the commands they run captured as verification evidence. |
 | `xenia` | POSTs to an OpenAI-compatible gateway at `CONCLAVE_XENIA_BASE_URL` (default `http://localhost:20128`), model selected by `xeniaModel`. | Verified against a live OmniRoute gateway (2026-09-27). These seats have no filesystem: Conclave sends them the repository's file list, and on the work side the full diff so far. Pin explicit model ids — `auto/*` routes vary in cost by an order of magnitude. |
 | `fake` | Deterministic in-process stub. Approves unless scripted otherwise. | For tests and dry runs — contacts no provider and spends nothing. |
 
@@ -272,6 +273,7 @@ conclave seats models codex             # what codex can switch to, and where th
 conclave seats set codex gpt-6-sol      # applies to new councils
 conclave seats test codex               # one small, billed call with exactly the flags a run uses
 conclave seats reset codex              # back to the CLI's default model
+conclave seats add grok                 # add a built-in seat your saved config predates
 conclave run "…" --model claude=claude-opus-5-5   # this council only
 ```
 
@@ -281,6 +283,7 @@ Where each seat's list comes from:
 | --- | --- | --- |
 | Xenia seats | The gateway's `/v1/models` | Authoritative: an unlisted id is refused unless you pass `--force`. Listed is not the same as working — test it. |
 | Antigravity | `agy models` | Authoritative. |
+| Grok Build | `grok models` (its default marked) | Any id Grok accepts works, including custom models from your Grok config. |
 | Codex | When `~/.codex/config.toml` routes Codex through a custom provider (e.g. a gateway), that provider's `/models`, as the bare ids Codex sends; otherwise Codex's own model cache for your account. The config's `model` is shown as the default. | Any id Codex accepts works. |
 | Claude | Known Claude model ids and the `fable`/`opus`/`sonnet`/`haiku` aliases | Claude Code has no list command. Aliases follow your Claude Code settings, which can remap them; a full id is exact. |
 
@@ -292,7 +295,7 @@ for one council.
 
 A per-council model is recorded with the session, so resuming it uses the same models. Every seat
 call also records the model the provider **reports actually answering** — Claude Code names it in
-its output, and a gateway names the upstream it routed to — next to the model Conclave asked for.
+its output, as does Grok Build, and a gateway names the upstream it routed to — next to the model Conclave asked for.
 The seat rail and `report.md` show that model, so an alias or an `auto/*` route never hides what
 really ran. (Codex does not report its model in machine-readable output; for it, the requested or
 configured model is what is shown.)
